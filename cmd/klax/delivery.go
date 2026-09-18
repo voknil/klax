@@ -22,6 +22,21 @@ func splitMessage(text string, limit int, format string) []string {
 	if format == "rich" {
 		return splitRichMessage(text, limit)
 	}
+	// format=="" (vk, ym) has no tag-stack to keep balanced across chunks —
+	// except ym actually renders ``` fenced code blocks (VK has no formatting
+	// at all), so a fence spanning a chunk boundary needs the same care
+	// splitHTMLMessage gives <pre>: close it at the cut, reopen it after.
+	// Only reached for text containing a fence at all, so the common
+	// (fence-free) case keeps using the plain splitter untouched.
+	if strings.Contains(text, "```") {
+		return splitPlainFencedMessage(text, limit)
+	}
+	return splitPlainMessage(text, limit)
+}
+
+// splitPlainMessage is the byte/newline-based splitter for plain (format=="")
+// text with no ``` fence to keep balanced.
+func splitPlainMessage(text string, limit int) []string {
 	if len(text) <= limit {
 		return []string{text}
 	}
@@ -48,6 +63,118 @@ func splitMessage(text string, limit int, format string) []string {
 			text = text[1:]
 		}
 	}
+	return chunks
+}
+
+// splitPlainFencedMessage splits format=="" text that contains at least one
+// ``` fence, line by line, keeping every fence balanced across chunks: a
+// chunk that would end while still inside a fence gets a closing ``` appended
+// and the next chunk reopens it with the same language tag — otherwise one
+// chunk would render an unterminated code block and the next would start
+// mid-block with no opening fence.
+func splitPlainFencedMessage(text string, limit int) []string {
+	lines := strings.Split(text, "\n")
+	var chunks []string
+	var cur []string
+	curLen := 0
+	inFence := false
+	fenceLang := ""
+
+	fenceMarker := func() string {
+		return "```" + fenceLang
+	}
+	flush := func() {
+		if len(cur) == 0 {
+			return
+		}
+		body := strings.Join(cur, "\n")
+		if inFence {
+			body += "\n```"
+		}
+		chunks = append(chunks, body)
+		cur = nil
+		curLen = 0
+		if inFence {
+			cur = append(cur, fenceMarker())
+			curLen = len(fenceMarker())
+		}
+	}
+	// appendLine adds one already-limit-sized piece, flushing first if it
+	// would overflow. Shared by the normal per-line path and the oversized-
+	// line hard-split below, so both go through the same fence bookkeeping.
+	appendLine := func(line string) {
+		sep := 0
+		if len(cur) > 0 {
+			sep = 1
+		}
+		reserve := 0
+		if inFence {
+			reserve = len("\n```")
+		}
+		// len(cur) > 1 guards forward progress: never flush a chunk that
+		// holds nothing but a just-reopened fence marker.
+		if curLen+sep+len(line)+reserve > limit && len(cur) > 1 {
+			flush()
+			sep = 0
+			if len(cur) > 0 {
+				sep = 1
+			}
+		}
+		cur = append(cur, line)
+		curLen += sep + len(line)
+	}
+
+	for _, line := range lines {
+		reserve := 0
+		if inFence {
+			reserve = len("\n```")
+		}
+		maxLine := limit - reserve
+		// A line that can never fit any chunk on its own (e.g. a huge
+		// unbroken tool-output line inside a fence) must be hard-split here,
+		// through appendLine/flush, so the fence stays balanced across the
+		// pieces — deferring to the fence-oblivious byte splitter (as a
+		// post-pass) would split an already-fence-wrapped chunk with no idea
+		// where the markers were. A static per-piece budget can overshoot
+		// `limit` by the reopened fence marker's own size (a few bytes) —
+		// accepted deliberately: maxMessageLen is a soft one-message target,
+		// not a hard API ceiling (real platform limits sit well above it),
+		// so the extra logic to shave that off isn't worth the complexity.
+		if maxLine > 0 && len(line) > maxLine {
+			flush() // start the oversized line in its own fresh chunk
+			rest := line
+			for len(rest) > 0 {
+				cut := maxLine
+				if cut > len(rest) {
+					cut = len(rest)
+				}
+				cut = alignUTF8Cut(rest, cut)
+				if cut <= 0 {
+					_, size := utf8.DecodeRuneInString(rest)
+					cut = size
+				}
+				appendLine(rest[:cut])
+				rest = rest[cut:]
+				if len(rest) > 0 {
+					flush()
+				}
+			}
+		} else {
+			appendLine(line)
+		}
+
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") {
+			if !inFence {
+				inFence = true
+				fenceLang = strings.TrimSpace(strings.TrimPrefix(trimmed, "```"))
+			} else {
+				inFence = false
+				fenceLang = ""
+			}
+		}
+	}
+	flush()
 	return chunks
 }
 
@@ -621,9 +748,12 @@ func sendReturnIDWithFormatFallback(ctx context.Context, t transport.Transport, 
 
 // tryEdit edits text with format, retrying on transient errors.
 // Falls back to plain text if formatted edit fails with a permanent error.
-func tryEdit(ctx context.Context, t transport.Transport, chatID, msgID, text, format string) error {
+// replyTo is the reply target the message was first created with — most
+// transports ignore it on edit, but ym needs it resent every time (see
+// ym.Bot.EditMessage).
+func tryEdit(ctx context.Context, t transport.Transport, chatID, msgID, text, replyTo, format string) error {
 	err := retryDo(ctx, func() error {
-		return t.EditMessage(chatID, msgID, text, format)
+		return t.EditMessage(chatID, msgID, text, replyTo, format)
 	})
 	if err == nil {
 		return nil
@@ -636,7 +766,7 @@ func tryEdit(ctx context.Context, t transport.Transport, chatID, msgID, text, fo
 	if format != "" && ctx.Err() == nil {
 		log.Printf("edit error (%s): %v, retrying plain", format, err)
 		return retryDo(ctx, func() error {
-			return t.EditMessage(chatID, msgID, plainFallback(text, format), "")
+			return t.EditMessage(chatID, msgID, plainFallback(text, format), replyTo, "")
 		})
 	}
 	return err
@@ -671,7 +801,7 @@ func (d *daemon) performTransportOp(ctx context.Context, op transportOp) (transp
 		format = fmtStr
 	}
 	if format == "" && op.useDefault {
-		text = stripHTML(text)
+		text = plainRenderForChat(op.fullChatID, text)
 	}
 
 	var (
@@ -679,7 +809,7 @@ func (d *daemon) performTransportOp(ctx context.Context, op transportOp) (transp
 		err error
 	)
 	if op.messageID != "" {
-		err = tryEdit(ctx, t, rawChatID, op.messageID, text, format)
+		err = tryEdit(ctx, t, rawChatID, op.messageID, text, op.replyTo, format)
 	} else if op.returnID {
 		res.messageID, err = trySendReturnID(ctx, t, rawChatID, op.replyTo, text, format)
 		if err == nil {
@@ -697,14 +827,20 @@ func (d *daemon) performTransportOp(ctx context.Context, op transportOp) (transp
 }
 
 type messageChain struct {
-	ids                []string
-	msgs               map[string]string
+	ids  []string
+	msgs map[string]string
+	// replyTos records, per message id, the replyTo it was actually created
+	// with (possibly ""). An edit must resend exactly that value — NOT just
+	// for ids[0]: a later chunk can also be created as a reply (see the
+	// "reply after gap" branch below), and ym needs reply_message_id resent
+	// on every edit or it silently drops the link.
+	replyTos           map[string]string
 	anchorReplyTo      string
 	lastCreateActivity uint64
 }
 
 func newMessageChain(ids ...string) *messageChain {
-	chain := &messageChain{msgs: make(map[string]string)}
+	chain := &messageChain{msgs: make(map[string]string), replyTos: make(map[string]string)}
 	for _, id := range ids {
 		if id == "" {
 			continue
@@ -721,6 +857,9 @@ func (mc *messageChain) ensure() *messageChain {
 	if mc.msgs == nil {
 		mc.msgs = make(map[string]string)
 	}
+	if mc.replyTos == nil {
+		mc.replyTos = make(map[string]string)
+	}
 	return mc
 }
 
@@ -729,7 +868,7 @@ func (mc *messageChain) ensure() *messageChain {
 // message-length handling live in exactly one place.
 func (d *daemon) syncMessageChain(ctx context.Context, fullChatID, replyTo string, chain *messageChain, text, format string) (*messageChain, error) {
 	if format == "" {
-		text = stripHTML(text)
+		text = plainRenderForChat(fullChatID, text)
 	}
 	chunks := splitMessage(text, maxMessageLen, format)
 	return d.syncMessageChainChunks(ctx, fullChatID, replyTo, chain, chunks, format)
@@ -754,9 +893,17 @@ func (d *daemon) syncMessageChainChunks(ctx context.Context, fullChatID, replyTo
 				sendCancel()
 				continue
 			}
+			// Resend exactly the replyTo this specific message was created
+			// with (not just chain.ids[0] — a later chunk can be a reply too,
+			// see the "reply after gap" branch below): ym needs it resent on
+			// every edit or it silently drops the link, and reusing the wrong
+			// value would either fabricate a reply that never existed or drop
+			// one that did.
+			editReplyTo := chain.replyTos[chain.ids[i]]
 			_, err = d.performTransportOp(sendCtx, transportOp{
 				fullChatID: fullChatID,
 				messageID:  chain.ids[i],
+				replyTo:    editReplyTo,
 				text:       chunk,
 				format:     format,
 			})
@@ -781,6 +928,7 @@ func (d *daemon) syncMessageChainChunks(ctx context.Context, fullChatID, replyTo
 			if err == nil {
 				chain.ids = append(chain.ids, res.messageID)
 				chain.msgs[res.messageID] = chunk + "\x00" + format
+				chain.replyTos[res.messageID] = chunkReplyTo
 				chain.lastCreateActivity = res.activity
 			}
 		}

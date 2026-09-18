@@ -3,10 +3,10 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 )
 
 type ScopeDefaults struct {
@@ -15,25 +15,48 @@ type ScopeDefaults struct {
 	Think     string `json:"think,omitempty"`
 	Sandbox   string `json:"sandbox,omitempty"`    // "on" | "off"
 	ClaudeTTY bool   `json:"claude_tty,omitempty"` // drive Claude through klax tty
+	CWD       string `json:"cwd,omitempty"`        // working directory for the next new session
+	// YM threads inherit group mode once, then evolve independently. Keep that
+	// per-thread state with the thread's sessions instead of materializing every
+	// discovered thread in config.json's explicit group_chats registry.
+	GroupMode           *bool  `json:"group_mode,omitempty"`
+	GroupVerbose        *bool  `json:"group_verbose,omitempty"`
+	GroupAttachmentMode string `json:"group_attachment_mode,omitempty"` // "off" | "on" (default) | "any"
+	// Deprecated development-build shape. Read only for a compatible migration:
+	// true meant today's "any"; false meant the old/default "on" behaviour.
+	LegacyGroupAttachments *bool `json:"group_attachments,omitempty"`
 }
 
 type Session struct {
-	ID                 string `json:"id"`                       // session UUID (claude or codex thread_id)
-	Name               string `json:"name"`                     // user-friendly name
-	CWD                string `json:"cwd"`                      // working directory
-	Created            int64  `json:"created"`                  // unix timestamp
-	LastUsed           int64  `json:"last_used"`                // unix timestamp
-	Active             bool   `json:"active"`                   // currently selected
-	Backend            string `json:"backend,omitempty"`        // "claude" (default) or "codex"
-	Model              string `json:"model,omitempty"`          // last used model (from result)
-	ModelOverride      string `json:"model_override,omitempty"` // user-selected model
-	ThinkOverride      string `json:"think_override,omitempty"` // thinking level
-	Sandbox            string `json:"sandbox,omitempty"`        // "on" | "off"
-	ClaudeTTY          bool   `json:"claude_tty,omitempty"`     // drive Claude through klax tty
-	ContextWindow      int    `json:"ctx_window,omitempty"`
-	ContextUsed        int    `json:"ctx_used,omitempty"`
-	Messages           int    `json:"messages"` // user message count
-	AppendSystemPrompt string `json:"append_system_prompt,omitempty"`
+	ID            string `json:"id"`                       // session UUID (claude or codex thread_id)
+	Name          string `json:"name"`                     // user-friendly name
+	CWD           string `json:"cwd"`                      // working directory
+	Created       int64  `json:"created"`                  // monotonic per-chat session key (never reused; not a timestamp for new sessions)
+	LastUsed      int64  `json:"last_used"`                // unix timestamp
+	Active        bool   `json:"active"`                   // currently selected
+	Backend       string `json:"backend,omitempty"`        // "claude" (default) or "codex"
+	Model         string `json:"model,omitempty"`          // last used model (from result)
+	ModelOverride string `json:"model_override,omitempty"` // user-selected model
+	ThinkOverride string `json:"think_override,omitempty"` // thinking level
+	Sandbox       string `json:"sandbox,omitempty"`        // "on" | "off"
+	ClaudeTTY     bool   `json:"claude_tty,omitempty"`     // drive Claude through klax tty
+	ContextWindow int    `json:"ctx_window,omitempty"`
+	ContextUsed   int    `json:"ctx_used,omitempty"`
+	Messages      int    `json:"messages"` // user message count
+	// Groups label a session for the UI's filtered views (one browser tab per group). A pure view
+	// filter: never a second source of order or session state, and never a place for computed
+	// "is:*" views, which are derived from live facts instead of stored here. A session may belong
+	// to several groups.
+	Groups []string `json:"groups,omitempty"`
+	// UI read-through watermark — the durable per-session unread cursor: the highest
+	// (turn_seq, block index) the user has read. Absent on legacy stores ⇒ 0 ("nothing read
+	// yet"). Consumed by the UI so the unread divider/badge/title survive a page reload
+	// and a daemon restart instead of re-baselining to "all read".
+	ReadThroughTurn        int64  `json:"read_through_turn,omitempty"`
+	ReadThroughBlock       int    `json:"read_through_block,omitempty"`
+	ReaderReadThroughTurn  int64  `json:"reader_read_through_turn,omitempty"`
+	ReaderReadThroughBlock int    `json:"reader_read_through_block,omitempty"`
+	AppendSystemPrompt     string `json:"append_system_prompt,omitempty"`
 	// Deprecated: rate limits moved to global config per backend.
 	// Keep fields for JSON backward compat (old sessions.json).
 	RateLimitStatus  string `json:"rl_status,omitempty"`
@@ -42,15 +65,48 @@ type Session struct {
 	RateLimitOverage bool   `json:"rl_overage,omitempty"`
 }
 
+// ReadThrough selects the durable watermark for the access role, independent of token rotation.
+func (s *Session) ReadThrough(readOnly bool) (int64, int) {
+	if readOnly {
+		return s.ReaderReadThroughTurn, s.ReaderReadThroughBlock
+	}
+	return s.ReadThroughTurn, s.ReadThroughBlock
+}
+
+func (s *Session) AdvanceReadThrough(readOnly bool, turn int64, block int) bool {
+	t, b := &s.ReadThroughTurn, &s.ReadThroughBlock
+	if readOnly {
+		t, b = &s.ReaderReadThroughTurn, &s.ReaderReadThroughBlock
+	}
+	if turn < *t || (turn == *t && block <= *b) {
+		return false
+	}
+	*t, *b = turn, block
+	return true
+}
+
 type ChatSessions struct {
-	Sessions []*Session `json:"sessions"`
+	// HighWater is the legacy per-chat high-water written by development builds before session keys
+	// became store-global. normalize folds it into Store.HighWater and clears it; keep the field only
+	// so those stores migrate without reusing a deleted session's key.
+	HighWater int64      `json:"high_water,omitempty"`
+	Sessions  []*Session `json:"sessions"`
 }
 
 type Store struct {
-	mu    sync.Mutex
-	Chats map[string]*ChatSessions  `json:"chats"`
-	Scope map[string]*ScopeDefaults `json:"scope_defaults,omitempty"`
-	path  string
+	mu sync.Mutex
+	// HighWater is the store-global monotonic session-key counter. Every new klax session, regardless
+	// of chat, gets the next value, so MergeKeys can never combine colliding identities.
+	HighWater int64                     `json:"high_water,omitempty"`
+	Chats     map[string]*ChatSessions  `json:"chats"`
+	Scope     map[string]*ScopeDefaults `json:"scope_defaults,omitempty"`
+	path      string
+}
+
+// nextCreated advances the store-global high-water. Caller holds s.mu.
+func (s *Store) nextCreated() int64 {
+	s.HighWater++
+	return s.HighWater
 }
 
 func (s *Session) UnmarshalJSON(data []byte) error {
@@ -74,6 +130,9 @@ func cloneSession(sess *Session) *Session {
 		return nil
 	}
 	cp := *sess
+	if len(sess.Groups) > 0 { // a shared backing array would let a caller mutate the stored session
+		cp.Groups = append([]string(nil), sess.Groups...)
+	}
 	return &cp
 }
 
@@ -82,6 +141,18 @@ func cloneDefaults(def *ScopeDefaults) *ScopeDefaults {
 		return nil
 	}
 	cp := *def
+	if def.GroupMode != nil {
+		enabled := *def.GroupMode
+		cp.GroupMode = &enabled
+	}
+	if def.GroupVerbose != nil {
+		verbose := *def.GroupVerbose
+		cp.GroupVerbose = &verbose
+	}
+	if def.LegacyGroupAttachments != nil {
+		attachments := *def.LegacyGroupAttachments
+		cp.LegacyGroupAttachments = &attachments
+	}
 	return &cp
 }
 
@@ -116,7 +187,7 @@ func LoadStore() (*Store, error) {
 	}
 
 	// Try new format first.
-	if err := json.Unmarshal(data, s); err == nil && (len(s.Chats) > 0 || len(s.Scope) > 0) {
+	if err := json.Unmarshal(data, s); err == nil && (s.HighWater > 0 || len(s.Chats) > 0 || len(s.Scope) > 0) {
 		s.normalize()
 		return s, nil
 	}
@@ -184,17 +255,23 @@ func (s *Store) MergeKeys(targetKey string, oldKeys []string) bool {
 
 func (s *Store) Save() error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveLocked()
+}
+
+func (s *Store) saveLocked() error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0700); err != nil {
-		s.mu.Unlock()
 		return err
 	}
 	path := s.path
 	payload := struct {
-		Chats map[string]*ChatSessions  `json:"chats"`
-		Scope map[string]*ScopeDefaults `json:"scope_defaults,omitempty"`
+		HighWater int64                     `json:"high_water,omitempty"`
+		Chats     map[string]*ChatSessions  `json:"chats"`
+		Scope     map[string]*ScopeDefaults `json:"scope_defaults,omitempty"`
 	}{
-		Chats: make(map[string]*ChatSessions, len(s.Chats)),
-		Scope: make(map[string]*ScopeDefaults, len(s.Scope)),
+		HighWater: s.HighWater,
+		Chats:     make(map[string]*ChatSessions, len(s.Chats)),
+		Scope:     make(map[string]*ScopeDefaults, len(s.Scope)),
 	}
 	for key, chat := range s.Chats {
 		payload.Chats[key] = &ChatSessions{Sessions: cloneSessions(chat.Sessions)}
@@ -202,13 +279,27 @@ func (s *Store) Save() error {
 	for key, def := range s.Scope {
 		payload.Scope[key] = cloneDefaults(def)
 	}
-	s.mu.Unlock()
 
 	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	f, err := os.CreateTemp(filepath.Dir(path), ".sessions-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err = f.Write(data); err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(f.Name(), path)
 }
 
 func (s *Store) chat(chatID string) *ChatSessions {
@@ -244,16 +335,40 @@ func (s *Store) normalize() {
 		if chat.Sessions == nil {
 			chat.Sessions = []*Session{}
 		}
+		// Migrate the short-lived per-chat counter format into the one canonical global source.
+		if chat.HighWater > s.HighWater {
+			s.HighWater = chat.HighWater
+		}
+		chat.HighWater = 0
 		def := s.scope(key)
 		for _, sess := range chat.Sessions {
 			if sess == nil {
 				continue
+			}
+			// Lift the global counter to every existing key. Legacy timestamp keys therefore remain valid,
+			// while every new key is unique across all chats and safe under MergeKeys.
+			if sess.Created > s.HighWater {
+				s.HighWater = sess.Created
 			}
 			if sess.Backend == "" && sess.Messages > 0 {
 				sess.Backend = "claude"
 			}
 			if def.Backend == "" && sess.Backend != "" {
 				def.Backend = sess.Backend
+			}
+		}
+	}
+}
+
+// EachSession calls fn for every (chatID, Created) in the store under the lock — used at startup to
+// rebuild derived indexes (e.g. the file-token index) from each session's on-disk state.
+func (s *Store) EachSession(fn func(chatID string, created int64)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for chatID, cs := range s.Chats {
+		for _, sess := range cs.Sessions {
+			if sess != nil {
+				fn(chatID, sess.Created)
 			}
 		}
 	}
@@ -315,6 +430,55 @@ func (s *Store) UpdateActive(chatID string, fn func(*Session)) *Session {
 	return nil
 }
 
+// ErrSessionNotFound is returned by UpdateSessionChecked when created has no match —
+// e.g. the session was deleted (/nuke, /new) between an earlier lookup and this call.
+var ErrSessionNotFound = errors.New("session not found")
+
+// UpdateSessionChecked applies fn to the session identified by created only if check
+// passes, both evaluated under the SAME lock — closing the gap between a precondition
+// verified earlier (e.g. Messages==0) and the mutation, during which a message could
+// have started and finished running. check may inspect but must not mutate sess; it
+// runs even when fn would be a no-op, so a failing check always short-circuits fn.
+// Returns the resulting session (unmodified if check failed) and check's error, or
+// ErrSessionNotFound if created has no match.
+func (s *Store) UpdateSessionChecked(chatID string, created int64, check func(*Session) error, fn func(*Session)) (*Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, sess := range s.chat(chatID).Sessions {
+		if sess.Created == created {
+			if check != nil {
+				if err := check(sess); err != nil {
+					return cloneSession(sess), err
+				}
+			}
+			fn(sess)
+			return cloneSession(sess), nil
+		}
+	}
+	return nil, ErrSessionNotFound
+}
+
+// SetCWDIfMessages0 re-checks Messages==0 for the session identified by created and,
+// if still true, sets both its CWD and the chat's ScopeDefaults.CWD under one lock —
+// closing the same TOCTOU gap as UpdateSessionChecked, specifically for /cwd (which
+// writes both fields together, unlike a plain UI settings patch). Returns the updated
+// session and true, or the current session and false if Messages>0 by now.
+func (s *Store) SetCWDIfMessages0(chatID string, created int64, cwd string) (*Session, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, sess := range s.chat(chatID).Sessions {
+		if sess.Created == created {
+			if sess.Messages > 0 {
+				return cloneSession(sess), false
+			}
+			sess.CWD = cwd
+			s.scope(chatID).CWD = cwd
+			return cloneSession(sess), true
+		}
+	}
+	return nil, false
+}
+
 func (s *Store) UpdateSession(chatID string, created int64, fn func(*Session)) *Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -353,19 +517,17 @@ func (s *Store) Ensure(chatID, name, cwd string, defaults ScopeDefaults) *Sessio
 	}
 	for _, sess := range cs.Sessions {
 		if sess.Active {
-			if cwd != "" && sess.CWD != cwd {
-				sess.CWD = cwd
-			}
 			return cloneSession(sess)
 		}
 	}
 	for _, sess := range cs.Sessions {
 		sess.Active = false
 	}
+	created := s.nextCreated()
 	sess := &Session{
 		Name:          name,
 		CWD:           cwd,
-		Created:       nextCreated(cs.Sessions),
+		Created:       created,
 		Active:        true,
 		Backend:       def.Backend,
 		ModelOverride: def.Model,
@@ -391,10 +553,11 @@ func (s *Store) New(chatID, name, cwd string, defaults ScopeDefaults) *Session {
 	for _, sess := range cs.Sessions {
 		sess.Active = false
 	}
+	created := s.nextCreated()
 	sess := &Session{
 		Name:          name,
 		CWD:           cwd,
-		Created:       nextCreated(cs.Sessions),
+		Created:       created,
 		Active:        true,
 		Backend:       def.Backend,
 		ModelOverride: def.Model,
@@ -406,28 +569,116 @@ func (s *Store) New(chatID, name, cwd string, defaults ScopeDefaults) *Session {
 	return cloneSession(sess)
 }
 
-// nextCreated returns a Created timestamp guaranteed to be unique within the
-// given slice. The Created field is the canonical key used by both UpdateSession
-// and the per-session runner map, so collisions (rapid back-to-back /new in the
-// same wall-clock second) would silently merge runs.
-func nextCreated(existing []*Session) int64 {
-	now := time.Now().Unix()
-	for _, sess := range existing {
-		if sess != nil && sess.Created >= now {
-			now = sess.Created + 1
+// Add inserts an ALREADY-FORMED session into a chat ATOMICALLY: under a single lock it deactivates
+// the current active session, assigns a unique Created, marks the new one active, and appends it. No
+// intermediate or partially-configured state is ever visible to a concurrent SessionsFor — the whole
+// session is published in one operation. The store takes ownership of `sess`; a clone is returned.
+func (s *Store) Add(chatID string, sess *Session) *Session {
+	return s.AddWithDefaults(chatID, sess, nil)
+}
+
+// AddWithDefaults atomically publishes an already-formed session AND, when defaults is non-nil,
+// records that same session's new-session template. Keeping both mutations under one lock means two
+// concurrent creates cannot leave the older session's defaults as the final template.
+func (s *Store) AddWithDefaults(chatID string, sess *Session, defaults *ScopeDefaults) *Session {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.addWithDefaultsLocked(chatID, sess, defaults)
+}
+
+func (s *Store) addWithDefaultsLocked(chatID string, sess *Session, defaults *ScopeDefaults) *Session {
+	cs := s.chat(chatID)
+	for _, existing := range cs.Sessions {
+		existing.Active = false
+	}
+	sess.Created = s.nextCreated()
+	sess.Active = true
+	cs.Sessions = append(cs.Sessions, sess)
+	if defaults != nil {
+		*s.scope(chatID) = *defaults
+	}
+	return cloneSession(sess)
+}
+
+func (s *Store) DeleteCreated(chatID string, created int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for idx, sess := range s.chat(chatID).Sessions {
+		if sess.Created == created {
+			return s.deleteLocked(chatID, idx)
 		}
 	}
-	return now
+	return false
 }
 
 func (s *Store) Delete(chatID string, idx int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.deleteLocked(chatID, idx)
+}
+
+func (s *Store) deleteLocked(chatID string, idx int) bool {
 	cs := s.chat(chatID)
 	if idx < 0 || idx >= len(cs.Sessions) {
 		return false
 	}
 	cs.Sessions = append(cs.Sessions[:idx], cs.Sessions[idx+1:]...)
+	return true
+}
+
+// Reorder rearranges a chat's sessions to match the given order of Created ids (the tab strip's
+// drag-and-drop). The order may be a SUBSET — a filtered group view drags only the tabs it shows — so
+// the permutation is SLOT-PRESERVING: the positions the listed sessions occupied are refilled in the
+// requested order, and every session not listed keeps its exact index.
+//
+// That is what makes one global order enough for every view: the relative order of any pair changes
+// only if BOTH of them were listed, so dragging inside one group cannot disturb another group whose
+// members it does not share. With a FULL list the occupied slots are all positions, so the result is
+// simply the requested order — the root strip's behaviour is unchanged.
+//
+// Unknown ids are ignored, so a stale client order can never drop or resurrect a tab. Returns true
+// if the order actually changed.
+func (s *Store) Reorder(chatID string, order []int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cs := s.chat(chatID)
+	if len(cs.Sessions) < 2 {
+		return false
+	}
+	byID := make(map[int64]*Session, len(cs.Sessions))
+	for _, sess := range cs.Sessions {
+		byID[sess.Created] = sess
+	}
+	seq := make([]*Session, 0, len(order)) // listed sessions that really exist, request order, deduped
+	listed := make(map[int64]bool, len(order))
+	for _, id := range order {
+		sess := byID[id]
+		if sess == nil || listed[id] {
+			continue
+		}
+		listed[id] = true
+		seq = append(seq, sess)
+	}
+	sorted := make([]*Session, len(cs.Sessions))
+	copy(sorted, cs.Sessions)
+	k := 0
+	for i, sess := range cs.Sessions {
+		if listed[sess.Created] {
+			sorted[i] = seq[k]
+			k++
+		}
+	}
+	changed := false
+	for i := range sorted {
+		if sorted[i] != cs.Sessions[i] {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return false
+	}
+	cs.Sessions = sorted
 	return true
 }
 
@@ -443,4 +694,36 @@ func (s *Store) Switch(chatID string, idx int) *Session {
 	}
 	cs.Sessions[idx].Active = true
 	return cloneSession(cs.Sessions[idx])
+}
+
+// AddPersisted publishes the configured session and defaults only after saving; failure restores the store under the same lock.
+func (s *Store) AddPersisted(chatID string, sess *Session, defaults *ScopeDefaults) (*Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	oldChat, hadChat := s.Chats[chatID]
+	var prior *ChatSessions
+	if hadChat {
+		cp := *oldChat
+		cp.Sessions = cloneSessions(oldChat.Sessions)
+		prior = &cp
+	}
+	oldDefaults, hadDefaults := s.Scope[chatID]
+	priorDefaults := cloneDefaults(oldDefaults)
+	highWater := s.HighWater
+	created := s.addWithDefaultsLocked(chatID, sess, defaults)
+	if err := s.saveLocked(); err != nil {
+		s.HighWater = highWater
+		if hadChat {
+			s.Chats[chatID] = prior
+		} else {
+			delete(s.Chats, chatID)
+		}
+		if hadDefaults {
+			s.Scope[chatID] = priorDefaults
+		} else {
+			delete(s.Scope, chatID)
+		}
+		return nil, err
+	}
+	return created, nil
 }

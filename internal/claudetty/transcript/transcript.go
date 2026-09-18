@@ -28,6 +28,10 @@ type Line struct {
 	Subtype    string
 	SessionID  string
 	IsAPIError bool
+	// IsMeta marks an SDK-injected internal row (e.g. the "[Image: …Multiply
+	// coordinates…]" annotation the harness adds when the model views an image).
+	// These are role=user but NOT human input, so they must never render as a message.
+	IsMeta     bool
 	Error      string
 	Compact    *CompactInfo
 	// Time is the line's transcript timestamp; zero when absent or
@@ -53,6 +57,7 @@ type rawLine struct {
 	SessionIDp        string `json:"session_id"`
 	Timestamp         string `json:"timestamp"`
 	IsSidechain       bool   `json:"isSidechain"`
+	IsMeta            bool   `json:"isMeta"`
 	IsAPIErrorMessage bool   `json:"isApiErrorMessage"`
 	Error             string `json:"error"`
 	CompactMetadata   *struct {
@@ -99,6 +104,7 @@ func Parse(line []byte) (Line, bool) {
 		Subtype:    r.Subtype,
 		SessionID:  sid,
 		IsAPIError: r.IsAPIErrorMessage,
+		IsMeta:     r.IsMeta,
 		Error:      r.Error,
 		Compact:    compact,
 		Time:       ts,
@@ -123,9 +129,9 @@ type Summary struct {
 	IsError   bool
 	NumTurns  int
 	Usage     Usage
-	// ContextWindow is the model's context size for the result envelope.
-	// The transcript never carries it, so the driver stamps an estimate
-	// derived from the model alias it launched claude with.
+	// ContextWindow is the model's context size for the result envelope. The
+	// Claude transcript never carries it and klax never estimates one, so it
+	// stays 0 (unknown) unless a real value is ever sourced from the stream.
 	ContextWindow int
 }
 
@@ -228,7 +234,11 @@ func (t *Tailer) Freeze() {
 // Pump reads newly-appended bytes and returns each complete line (without
 // the trailing newline). Returns nil when nothing new is available.
 func (t *Tailer) Pump() [][]byte {
-	// Auto-compact can rewrite the transcript shorter. If the file is now
+	// Production compact_boundary is an ordinary append-only JSONL record; it
+	// does not renumber the physical event sequence consumed by history. This
+	// shrink branch is only defensive live-tail recovery if the CLI unexpectedly
+	// truncates/replaces the path under an open tailer. It must not be treated as
+	// the persistence contract for normal compaction. If the file is now
 	// smaller than our read offset it was truncated/replaced under us;
 	// ReadAt would otherwise sit past EOF forever and never see the new
 	// content. Restart from the top so we can re-find this turn's prompt

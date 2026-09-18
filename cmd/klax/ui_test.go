@@ -1,13 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"image"
+	_ "image/png"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/PiDmitrius/klax/internal/config"
+	"github.com/PiDmitrius/klax/internal/runner"
 )
 
 func decodeEvent(t *testing.T, raw json.RawMessage) uiEvent {
@@ -19,15 +26,28 @@ func decodeEvent(t *testing.T, raw json.RawMessage) uiEvent {
 	return ev
 }
 
-// Every broadcast event gets a monotonic seq and is retained per user; collect
+func TestQueuedCountExcludesFirstIdleQueuedMessage(t *testing.T) {
+	d := &daemon{runners: map[runnerKey]*sessionRunner{}}
+	sr := &sessionRunner{runner: runner.New(), queue: []queuedMsg{{turnSeq: 1}}}
+	d.runners[runnerKey{sk: "user:x", created: 1}] = sr
+	if got := d.queuedCount("user:x", 1); got != 0 {
+		t.Fatalf("idle first queued count = %d, want 0", got)
+	}
+	sr.processing = true
+	if got := d.queuedCount("user:x", 1); got != 1 {
+		t.Fatalf("processing queued count = %d, want 1", got)
+	}
+}
+
+// Every retained event (a notice — the only kind kept now) gets a monotonic seq per user; collect
 // returns everything after a cursor, the head, and whether the cursor is coverable.
 func TestUIHubCollect(t *testing.T) {
 	h := newUIHub()
 	for i := 0; i < 5; i++ {
-		h.broadcast("claw", uiEvent{Type: "progress", Text: "x"})
+		h.broadcast("alice", uiEvent{Type: "notice", Text: "x"})
 	}
 	// From cursor 0: all 5, head 5, no reload.
-	ev, head, reload := h.collect("claw", h.epoch, 0)
+	ev, head, reload := h.collect("alice", h.epoch, 0)
 	if reload || head != 5 || len(ev) != 5 {
 		t.Fatalf("collect(0): n=%d head=%d reload=%v, want 5/5/false", len(ev), head, reload)
 	}
@@ -35,43 +55,33 @@ func TestUIHubCollect(t *testing.T) {
 		t.Fatalf("first seq=%d, want 1", first.Seq)
 	}
 	// From cursor 2: exactly 3,4,5.
-	if ev, _, _ := h.collect("claw", h.epoch, 2); len(ev) != 3 || decodeEvent(t, ev[0]).Seq != 3 {
+	if ev, _, _ := h.collect("alice", h.epoch, 2); len(ev) != 3 || decodeEvent(t, ev[0]).Seq != 3 {
 		t.Fatalf("collect(2): n=%d first=%d, want 3 starting at seq 3", len(ev), decodeEvent(t, ev[0]).Seq)
 	}
 	// Up to date: nothing, no reload.
-	if ev, _, reload := h.collect("claw", h.epoch, 5); reload || len(ev) != 0 {
+	if ev, _, reload := h.collect("alice", h.epoch, 5); reload || len(ev) != 0 {
 		t.Fatalf("collect(5): n=%d reload=%v, want 0/false", len(ev), reload)
 	}
 	// Stale epoch (daemon restart) -> reload.
-	if _, _, reload := h.collect("claw", h.epoch+1, 2); !reload {
+	if _, _, reload := h.collect("alice", h.epoch+1, 2); !reload {
 		t.Fatal("a stale-epoch cursor must report reload")
 	}
 }
 
-// A cursor older than the retained ring (overflow) -> reload (transcript backstop).
+// A notice cursor older than the retained ring (overflow) -> reload (transcript backstop).
 func TestUIHubCollectGapOnOverflow(t *testing.T) {
 	h := newUIHub()
 	for i := 0; i < uiRingMaxItems+50; i++ {
-		h.broadcast("claw", uiEvent{Type: "progress", Text: "x"})
+		h.broadcast("alice", uiEvent{Type: "notice", Text: "x"})
 	}
-	if _, _, reload := h.collect("claw", h.epoch, 1); !reload {
+	if _, _, reload := h.collect("alice", h.epoch, 1); !reload {
 		t.Fatal("a cursor predating the ring must report reload")
 	}
 }
 
-// The user-echo event carries the sender's nonce (so the sending tab skips its
-// own optimistic echo) and round-trips through the ring intact.
-func TestUIUserEventCarriesNonce(t *testing.T) {
-	h := newUIHub()
-	h.broadcast("claw", uiEvent{Type: "user", Session: 5, Text: "hi", Nonce: "n1"})
-	ev, _, _ := h.collect("claw", h.epoch, 0)
-	if len(ev) != 1 {
-		t.Fatalf("got %d events, want 1", len(ev))
-	}
-	if e := decodeEvent(t, ev[0]); e.Type != "user" || e.Text != "hi" || e.Nonce != "n1" || e.Session != 5 {
-		t.Fatalf("user event = %+v, want user/hi/n1/session5", e)
-	}
-}
+// (The user-echo-via-ring and delivery-emits-error tests were removed with the ring content
+// channel: a turn's user bubble and its aborted/error block now come from the durable log via
+// buildReadModel, delivered by the tail — covered by the tailFrom/unreadAfter tests.)
 
 // Events are retained per user; one user's events never leak into another's.
 func TestUIHubIsolatesUsers(t *testing.T) {
@@ -89,17 +99,81 @@ func TestUIHubIsolatesUsers(t *testing.T) {
 // that user closes the channel it holds (lost-wakeup-safe).
 func TestUIHubWakeOnEmit(t *testing.T) {
 	h := newUIHub()
-	ch := h.waitChan("claw")
+	ch := h.waitChan("alice")
 	select {
 	case <-ch:
 		t.Fatal("wake channel fired before any emit")
 	default:
 	}
-	h.broadcast("claw", uiEvent{Type: "progress", Text: "x"})
+	h.broadcast("alice", uiEvent{Type: "progress", Text: "x"})
 	select {
 	case <-ch: // emit closed the channel we were holding
 	default:
 		t.Fatal("emit did not wake a held waiter")
+	}
+}
+
+// bumpSessions advances the per-user strip revision AND wakes held polls, so handleTail can return
+// a sessions-only change (rename/create/close/cross-tab read) immediately instead of holding to
+// the timeout.
+func TestBumpSessionsAdvancesRevAndWakes(t *testing.T) {
+	h := newUIHub()
+	if h.sessionsRev("alice") != 0 {
+		t.Fatalf("fresh rev = %d, want 0", h.sessionsRev("alice"))
+	}
+	ch := h.waitChan("alice")
+	h.bumpSessions("alice")
+	if got := h.sessionsRev("alice"); got != 1 {
+		t.Fatalf("rev after bump = %d, want 1", got)
+	}
+	select {
+	case <-ch: // the bump woke the held poll
+	default:
+		t.Fatal("bumpSessions did not wake a held poll")
+	}
+}
+
+// A daemon-wide notice must reach a user who polled at least once but is between polls now (no
+// inflight, and no ring entry since content isn't retained) — else the restart/update banner is
+// silently dropped for an open UI.
+func TestBroadcastAllReachesKnownUserBetweenPolls(t *testing.T) {
+	h := newUIHub()
+	h.enterPoll("alice") // marks the user known
+	h.leavePoll("alice") // now: not inflight, no ring entry
+	h.broadcastAll(uiEvent{Type: "notice", Text: "restart"})
+	if ev, _, _ := h.collect("alice", h.epoch, 0); len(ev) != 1 {
+		t.Fatalf("known user between polls missed the notice: got %d events, want 1", len(ev))
+	}
+}
+
+func TestNoticeBarrierWaitsForClientCursor(t *testing.T) {
+	h := newUIHub()
+	h.enterPoll("alice")
+	h.leavePoll("alice")
+	h.observeClient("alice", "tab-a", "")
+	h.observeClient("alice", "tab-b", "")
+	targets := h.broadcastAll(uiEvent{Type: "notice", Text: "restart"})
+	done := make(chan struct{})
+	go func() {
+		h.waitAcknowledged(targets, time.Second)
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("barrier returned before the client acknowledged the notice")
+	case <-time.After(10 * time.Millisecond):
+	}
+	h.observeClient("alice", "tab-a", fmt.Sprintf("%d-%d", h.epoch, targets[uiClientKey("alice", "tab-a")]))
+	select {
+	case <-done:
+		t.Fatal("barrier returned after only one of two tabs acknowledged the notice")
+	case <-time.After(10 * time.Millisecond):
+	}
+	h.observeClient("alice", "tab-b", fmt.Sprintf("%d-%d", h.epoch, targets[uiClientKey("alice", "tab-b")]))
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("barrier did not release after the client acknowledged the notice")
 	}
 }
 
@@ -108,29 +182,29 @@ func TestUIHubWakeOnEmit(t *testing.T) {
 func TestUIHubInflightCap(t *testing.T) {
 	h := newUIHub()
 	for i := 0; i < uiMaxInflightPerUser; i++ {
-		if !h.enterPoll("claw") {
+		if !h.enterPoll("alice") {
 			t.Fatalf("enterPoll refused at %d, under the cap", i)
 		}
 	}
-	if h.enterPoll("claw") {
+	if h.enterPoll("alice") {
 		t.Fatal("enterPoll must refuse past the cap")
 	}
-	h.leavePoll("claw")
-	if !h.enterPoll("claw") {
+	h.leavePoll("alice")
+	if !h.enterPoll("alice") {
 		t.Fatal("a freed slot must allow a new poll")
 	}
 }
 
 func TestBuildUITokens(t *testing.T) {
 	tokens, err := buildUITokens([]config.UserIdentity{
-		{ID: "claw", UIToken: "secret1"},
+		{ID: "alice", UIToken: "secret1"},
 		{ID: "bob", UIToken: "secret2"},
 		{ID: "noui"}, // no token — skipped, not an error
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(tokens) != 2 || tokens["secret1"] != "claw" || tokens["secret2"] != "bob" {
+	if len(tokens) != 2 || tokens["secret1"].User != "alice" || tokens["secret2"].User != "bob" {
 		t.Fatalf("bad token map: %v", tokens)
 	}
 	if _, err := buildUITokens([]config.UserIdentity{{ID: "a", UIToken: "dup"}, {ID: "b", UIToken: "dup"}}); err == nil {
@@ -142,17 +216,17 @@ func TestBuildUITokens(t *testing.T) {
 }
 
 func TestUIServerAuth(t *testing.T) {
-	s := &uiServer{tokens: map[string]string{"secret": "claw"}}
+	s := &uiServer{tokens: map[string]uiAccess{"secret": {User: "alice"}}}
 
 	bearer := httptest.NewRequest("GET", "/api/sessions", nil)
 	bearer.Header.Set("Authorization", "Bearer secret")
-	if u, ok := s.auth(bearer); !ok || u != "claw" {
+	if u, ok := s.auth(bearer); !ok || u != "alice" {
 		t.Fatalf("bearer auth: got %q ok=%v", u, ok)
 	}
 
-	// A query-string token is NOT accepted: every UI request (incl. the long-poll)
+	// A query-string token is NOT accepted: every UI request (incl. the tail long-poll)
 	// sets the Authorization header, so there is no ?token= auth path.
-	query := httptest.NewRequest("GET", "/api/poll?token=secret", nil)
+	query := httptest.NewRequest("GET", "/api/tail?token=secret", nil)
 	if _, ok := s.auth(query); ok {
 		t.Fatal("query token must not authenticate")
 	}
@@ -172,82 +246,84 @@ func TestUIServerAuth(t *testing.T) {
 // The UI shares the session list with messenger DMs for the same person: a
 // ui:<id> chat and a mapped tg DM both resolve to user:<id>.
 func TestSessionKeyUISharesIdentity(t *testing.T) {
-	d := &daemon{identities: map[int64]string{42: "claw"}}
-	if got := d.sessionKey("ui:claw"); got != "user:claw" {
-		t.Fatalf("ui sessionKey = %q, want user:claw", got)
+	d := &daemon{identities: map[int64]string{42: "alice"}}
+	if got := d.sessionKey("ui:alice"); got != "user:alice" {
+		t.Fatalf("ui sessionKey = %q, want user:alice", got)
 	}
-	if got := d.sessionKey("tg:42"); got != "user:claw" {
-		t.Fatalf("tg sessionKey = %q, want user:claw (shared identity)", got)
+	if got := d.sessionKey("tg:42"); got != "user:alice" {
+		t.Fatalf("tg sessionKey = %q, want user:alice (shared identity)", got)
 	}
 }
 
 func TestDeliveryForRoutesUIChat(t *testing.T) {
 	d := &daemon{uiHub: newUIHub()}
-	del := d.deliveryFor(context.Background(), queuedMsg{chatID: "ui:claw", sessCreated: 5}, true)
+	del := d.deliveryFor(context.Background(), queuedMsg{chatID: "ui:alice", sessCreated: 5}, true)
 	if _, ok := del.(*uiDelivery); !ok {
 		t.Fatalf("ui chat must get *uiDelivery, got %T", del)
 	}
 	del.Close()
 }
 
-// A messenger turn on a canonical "user:" session is mirrored to the web UI (tee),
-// so its answer/progress stream there live — not only on reload. A raw (unmapped)
-// messenger session is not mirrored, and never leaks to a UI hub.
+// A messenger turn on a canonical "user:" session is mirrored to the web UI (tee): its delivery
+// POKES the canonical user's tail so the answer/progress stream there live, not only on reload. A
+// raw (unmapped) messenger session is not mirrored, and never pokes a UI hub.
 func TestDeliveryForMirrorsMessengerToUI(t *testing.T) {
 	d := newTestDeliveryDaemon(&fakeTransport{})
 	d.uiHub = newUIHub()
 
-	del := d.deliveryFor(context.Background(), queuedMsg{chatID: "tg:1", sessKey: "user:claw", sessCreated: 7}, true)
+	canon := d.uiHub.waitChan("alice")
+	del := d.deliveryFor(context.Background(), queuedMsg{chatID: "tg:1", sessKey: "user:alice", sessCreated: 7}, true)
 	if _, ok := del.(teeDelivery); !ok {
 		t.Fatalf("canonical messenger session must mirror to UI (teeDelivery), got %T", del)
 	}
 	del.Close()
-	if ev, _, _ := d.uiHub.collect("claw", d.uiHub.epoch, 0); len(ev) == 0 {
-		t.Fatal("messenger turn not mirrored to the canonical UI hub")
-	} else if e := decodeEvent(t, ev[0]); e.Type != "turn_start" || e.Session != 7 {
-		t.Fatalf("mirror event = %+v, want turn_start session 7", e)
+	select {
+	case <-canon: // the tee's newUIDelivery poked the canonical UI hub
+	default:
+		t.Fatal("messenger turn not mirrored (no poke) to the canonical UI hub")
 	}
 
+	raw := d.uiHub.waitChan("2")
 	del2 := d.deliveryFor(context.Background(), queuedMsg{chatID: "tg:2", sessKey: "tg:2", sessCreated: 9}, true)
 	if _, ok := del2.(teeDelivery); ok {
 		t.Fatal("a raw (unmapped) messenger session must NOT mirror to UI")
 	}
 	del2.Close()
-	if ev, _, _ := d.uiHub.collect("2", d.uiHub.epoch, 0); len(ev) != 0 {
-		t.Fatalf("raw messenger session leaked %d events to a UI hub", len(ev))
+	select {
+	case <-raw:
+		t.Fatal("raw messenger session leaked a poke to a UI hub")
+	default:
 	}
 }
 
+// newUIDelivery pokes the CANONICAL user's tail (user:alice -> "alice"), never the raw messenger id.
 func TestUIDeliveryUsesCanonicalSessionUser(t *testing.T) {
 	h := newUIHub()
 	d := &daemon{uiHub: h}
-	del := d.newUIDelivery(context.Background(), queuedMsg{
-		chatID:      "tg:42",
-		sessKey:     "user:claw",
-		sessCreated: 7,
-	})
-	del.Close()
+	canon := h.waitChan("alice")
+	raw := h.waitChan("42")
+	d.newUIDelivery(context.Background(), queuedMsg{chatID: "tg:42", sessKey: "user:alice", sessCreated: 7})
 
-	ev, _, _ := h.collect("claw", h.epoch, 0)
-	if len(ev) != 1 {
-		t.Fatalf("canonical user got %d events, want 1 turn_start", len(ev))
+	select {
+	case <-canon: // poked the canonical user
+	default:
+		t.Fatal("newUIDelivery did not poke the canonical user")
 	}
-	if e := decodeEvent(t, ev[0]); e.Type != "turn_start" || e.Session != 7 {
-		t.Fatalf("event = %+v, want turn_start for session 7", e)
-	}
-	if raw, _, _ := h.collect("42", h.epoch, 0); len(raw) != 0 {
-		t.Fatal("raw messenger id received the canonical UI event")
+	select {
+	case <-raw:
+		t.Fatal("newUIDelivery poked the raw messenger id instead of the canonical user")
+	default:
 	}
 }
 
 func TestUITransportUsesCanonicalSessionUser(t *testing.T) {
 	h := newUIHub()
-	d := &daemon{uiHub: h, identities: map[int64]string{42: "claw"}}
+	d := &daemon{uiHub: h, identities: map[int64]string{42: "alice"}}
 	if err := (&uiTransport{d: d}).SendMessage("tg:42", "status", "", ""); err != nil {
 		t.Fatalf("SendMessage: %v", err)
 	}
 
-	ev, _, _ := h.collect("claw", h.epoch, 0)
+	ev, _, _ := h.collect("alice", h.epoch, 0)
 	if len(ev) != 1 {
 		t.Fatalf("canonical user got %d events, want 1 notice", len(ev))
 	}
@@ -264,11 +340,11 @@ func TestUITransportUsesCanonicalSessionUser(t *testing.T) {
 func TestUIServerRoutes(t *testing.T) {
 	d := &daemon{
 		cfg:     &config.Config{},
-		store:   newStoreWithChat("user:claw", "one"),
+		store:   newStoreWithChat("user:alice", "one"),
 		uiHub:   newUIHub(),
 		runners: make(map[runnerKey]*sessionRunner),
 	}
-	h := (&uiServer{d: d, tokens: map[string]string{"sec": "claw"}}).routes()
+	h := (&uiServer{d: d, tokens: map[string]uiAccess{"sec": {User: "alice"}}}).routes()
 
 	spa := httptest.NewRecorder()
 	h.ServeHTTP(spa, httptest.NewRequest("GET", "/", nil))
@@ -290,13 +366,14 @@ func TestUIServerRoutes(t *testing.T) {
 		t.Fatalf("authenticated /api/sessions: code=%d body=%s", ok.Code, ok.Body.String())
 	}
 
-	// A fresh long-poll (no cursor) returns immediately with a cursor to start from.
-	poll := httptest.NewRecorder()
-	preq := httptest.NewRequest("GET", "/api/poll", nil)
-	preq.Header.Set("Authorization", "Bearer sec")
-	h.ServeHTTP(poll, preq)
-	if poll.Code != 200 || !strings.Contains(poll.Body.String(), `"cursor"`) {
-		t.Fatalf("fresh /api/poll: code=%d body=%s", poll.Code, poll.Body.String())
+	// The tail long-poll is wired and authenticated: a malformed body reaches handleTail and is
+	// rejected 400 (not 404/401), proving the route past auth without holding the poll open.
+	tail := httptest.NewRecorder()
+	treq := httptest.NewRequest("POST", "/api/tail", strings.NewReader("not json"))
+	treq.Header.Set("Authorization", "Bearer sec")
+	h.ServeHTTP(tail, treq)
+	if tail.Code != 400 {
+		t.Fatalf("/api/tail with a bad body: code=%d, want 400 (route reached handleTail)", tail.Code)
 	}
 
 	// The UI has no chat commands: the /api/command endpoint is gone (it falls
@@ -311,9 +388,9 @@ func TestUIServerRoutes(t *testing.T) {
 }
 
 func TestUISendRequiresSession(t *testing.T) {
-	d := &daemon{cfg: &config.Config{}, store: newStoreWithChat("user:claw", "one"),
+	d := &daemon{cfg: &config.Config{}, store: newStoreWithChat("user:alice", "one"),
 		uiHub: newUIHub(), runners: make(map[runnerKey]*sessionRunner)}
-	h := (&uiServer{d: d, tokens: map[string]string{"sec": "claw"}}).routes()
+	h := (&uiServer{d: d, tokens: map[string]uiAccess{"sec": {User: "alice"}}}).routes()
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/send", strings.NewReader(`{"text":"hi"}`))
 	req.Header.Set("Authorization", "Bearer sec")
@@ -325,8 +402,8 @@ func TestUISendRequiresSession(t *testing.T) {
 }
 
 func TestUIAbortValidatesSession(t *testing.T) {
-	d := &daemon{store: newStoreWithChat("user:claw", "one"), runners: make(map[runnerKey]*sessionRunner)}
-	h := (&uiServer{d: d, tokens: map[string]string{"sec": "claw"}}).routes()
+	d := &daemon{store: newStoreWithChat("user:alice", "one"), runners: make(map[runnerKey]*sessionRunner)}
+	h := (&uiServer{d: d, tokens: map[string]uiAccess{"sec": {User: "alice"}}}).routes()
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/abort", strings.NewReader(`{"session":99999}`))
 	req.Header.Set("Authorization", "Bearer sec")
@@ -364,6 +441,84 @@ func TestHandleSPAInjectsUITitle(t *testing.T) {
 
 	if esc := serve("<b>"); strings.Contains(esc, "<title><b></title>") || !strings.Contains(esc, "&lt;b&gt;") {
 		t.Fatal("ui_title must be HTML-escaped")
+	}
+}
+
+func TestHandleSPAManifestUsesConfiguredTitle(t *testing.T) {
+	s := &uiServer{d: &daemon{cfg: &config.Config{UITitle: `KLODIN "mobile"`}}}
+	rec := httptest.NewRecorder()
+	s.handleSPA(rec, httptest.NewRequest("GET", "/manifest.webmanifest", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("manifest code=%d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/manifest+json" {
+		t.Fatalf("manifest content-type=%q", ct)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "public, max-age=3600" {
+		t.Fatalf("manifest cache-control=%q", got)
+	}
+	var manifest struct {
+		Name       string `json:"name"`
+		ShortName  string `json:"short_name"`
+		StartURL   string `json:"start_url"`
+		Scope      string `json:"scope"`
+		Display    string `json:"display"`
+		ThemeColor string `json:"theme_color"`
+		Background string `json:"background_color"`
+		Icons      []struct {
+			Src     string `json:"src"`
+			Sizes   string `json:"sizes"`
+			Type    string `json:"type"`
+			Purpose string `json:"purpose"`
+		} `json:"icons"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &manifest); err != nil {
+		t.Fatalf("decode manifest: %v", err)
+	}
+	if manifest.Name != `KLODIN "mobile"` || manifest.ShortName != manifest.Name {
+		t.Fatalf("manifest names = %q / %q", manifest.Name, manifest.ShortName)
+	}
+	if manifest.StartURL != "." || manifest.Scope != "." || manifest.Display != "standalone" {
+		t.Fatalf("manifest routing/display = %+v", manifest)
+	}
+	if manifest.ThemeColor != "#f5f6f8" || manifest.Background != "#f5f6f8" || len(manifest.Icons) != 4 {
+		t.Fatalf("manifest theme/icons = %+v", manifest)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw manifest: %v", err)
+	}
+	if _, ok := raw["id"]; ok {
+		t.Fatal("manifest must omit id: a relative id resolves at the origin and loses a reverse-proxy prefix")
+	}
+	maskable := 0
+	for _, icon := range manifest.Icons {
+		if icon.Type != "image/png" {
+			t.Fatalf("icon %s type = %q", icon.Src, icon.Type)
+		}
+		if icon.Purpose == "maskable" {
+			maskable++
+		}
+		path := "/" + strings.TrimPrefix(icon.Src, "./")
+		iconRec := httptest.NewRecorder()
+		s.handleSPA(iconRec, httptest.NewRequest("GET", path, nil))
+		if iconRec.Code != http.StatusOK || iconRec.Header().Get("Content-Type") != "image/png" {
+			t.Fatalf("icon %s: code %d, content-type %q", icon.Src, iconRec.Code, iconRec.Header().Get("Content-Type"))
+		}
+		if got := iconRec.Header().Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
+			t.Fatalf("icon %s cache-control=%q", icon.Src, got)
+		}
+		cfg, _, err := image.DecodeConfig(bytes.NewReader(iconRec.Body.Bytes()))
+		if err != nil {
+			t.Fatalf("decode icon %s: %v", icon.Src, err)
+		}
+		actual := fmt.Sprintf("%dx%d", cfg.Width, cfg.Height)
+		if actual != icon.Sizes {
+			t.Fatalf("icon %s declares %s, actual %s", icon.Src, icon.Sizes, actual)
+		}
+	}
+	if maskable != 1 {
+		t.Fatalf("manifest has %d maskable icons, want 1", maskable)
 	}
 }
 

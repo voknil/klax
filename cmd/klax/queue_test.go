@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -9,7 +10,7 @@ import (
 )
 
 func TestShouldReuseQueuedProgressWithoutGap(t *testing.T) {
-	d := newTestDaemon()
+	d := newTestDaemon(t)
 	d.chatEvents = map[string]uint64{"tg:1": 3}
 
 	msg := queuedMsg{
@@ -24,7 +25,7 @@ func TestShouldReuseQueuedProgressWithoutGap(t *testing.T) {
 }
 
 func TestShouldReuseQueuedProgressReturnsFalseAfterGap(t *testing.T) {
-	d := newTestDaemon()
+	d := newTestDaemon(t)
 	d.chatEvents = map[string]uint64{"tg:1": 4}
 
 	msg := queuedMsg{
@@ -39,13 +40,60 @@ func TestShouldReuseQueuedProgressReturnsFalseAfterGap(t *testing.T) {
 }
 
 func TestFormatRunFailureUsesAbortMarkerOnCancel(t *testing.T) {
-	got := formatRunFailure([]runner.ProgressEvent{
+	chunks := formatRunFailureChunks([]runner.ProgressEvent{
 		{Kind: runner.ProgressKindTool, Text: "🔧 build"},
 	}, "", context.Canceled)
+	got := strings.Join(chunks, "\n\n")
 
 	want := "`🔧 build`\n\n❌ Прервано."
 	if got != want {
 		t.Fatalf("unexpected cancel text:\nwant: %q\ngot:  %q", want, got)
+	}
+}
+
+func TestFormatRunFailureIsTerminal(t *testing.T) {
+	chunks := formatRunFailureChunks([]runner.ProgressEvent{
+		{Kind: runner.ProgressKindTool, Text: "⚙️ Exec: `true`"},
+		{Kind: runner.ProgressKindTool, Text: "❓ error"},
+	}, "", errors.New("codex exited"))
+	got := strings.Join(chunks, "\n\n")
+
+	want := "`⚙️ Exec: 'true'`\n`❓ error`\n\n❌ Ошибка: codex exited"
+	if got != want {
+		t.Fatalf("unexpected failure text:\nwant: %q\ngot:  %q", want, got)
+	}
+	if strings.Contains(got, "...") {
+		t.Fatalf("terminal failure retains a working marker: %q", got)
+	}
+}
+
+func TestFormatRunFailureEscapesErrorTextForMarkup(t *testing.T) {
+	err := errors.New("model <x> is at capacity & overloaded")
+	for _, format := range []string{"html", "rich"} {
+		got := strings.Join(formatRunFailureChunks(nil, format, err), "\n\n")
+		if strings.Contains(got, "<x>") || strings.Contains(got, " & ") {
+			t.Fatalf("%s failure text keeps raw markup: %q", format, got)
+		}
+		if !strings.Contains(got, "&lt;x&gt;") || !strings.Contains(got, "&amp;") {
+			t.Fatalf("%s failure text is not escaped: %q", format, got)
+		}
+	}
+}
+
+func TestFormatRunFailureReplacesWholeProgressChain(t *testing.T) {
+	logItems := []runner.ProgressEvent{
+		{Kind: runner.ProgressKindTool, Text: "⚙️ Exec: `first`"},
+		{Kind: runner.ProgressKindNarration, Text: strings.Repeat("narration ", 350)},
+		{Kind: runner.ProgressKindTool, Text: "⚙️ Exec: `second`"},
+		{Kind: runner.ProgressKindTool, Text: "⚙️ Exec: `third`"},
+	}
+	progress := withProgressEllipsis(formatLogChunks(logItems, "", "", maxMessageLen), "", maxMessageLen)
+	final := formatRunFailureChunks(logItems, "", errors.New("terminal"))
+	if len(final) < len(progress) {
+		t.Fatalf("final chain has %d chunks, progress chain has %d; stale working messages would survive", len(final), len(progress))
+	}
+	if strings.HasSuffix(final[len(final)-1], "...") {
+		t.Fatalf("terminal chain retains working marker: %q", final[len(final)-1])
 	}
 }
 
@@ -215,20 +263,58 @@ func TestAbortQueuedMessagesMarksAllQueueProgressAsAborted(t *testing.T) {
 	d := newTestDeliveryDaemon(tp)
 
 	d.abortQueuedMessages([]queuedMsg{
-		{chatID: "tg:1", progressID: "q1"},
-		{chatID: "tg:1", progressID: "q2"},
+		{chatID: "tg:1", msgID: "user-1", progressID: "q1"},
+		{chatID: "tg:1", msgID: "user-2", progressID: "q2"},
 		{chatID: "tg:1"},
 	})
 
 	if tp.editCalls != 2 {
 		t.Fatalf("expected 2 queued progress edits, got %d", tp.editCalls)
 	}
+	wantReply := map[string]string{"q1": "user-1", "q2": "user-2"}
 	for i, call := range tp.editLog {
 		if call.text != "❌ Прервано." {
 			t.Fatalf("edit %d text = %q, want %q", i, call.text, "❌ Прервано.")
 		}
-		if call.message != "q1" && call.message != "q2" {
+		want, ok := wantReply[call.message]
+		if !ok {
 			t.Fatalf("unexpected message id in edit %d: %q", i, call.message)
+		}
+		// The placeholder was created as a reply to its own message — the
+		// abort edit must resend that same replyTo (ym drops it otherwise).
+		if call.replyTo != want {
+			t.Fatalf("edit %d (message %q) replyTo = %q, want %q", i, call.message, call.replyTo, want)
+		}
+	}
+}
+
+func TestNotifyQueuePositionsUpdatesPositionAndReplyTo(t *testing.T) {
+	tp := &fakeTransport{}
+	d := newTestDeliveryDaemon(tp)
+
+	d.notifyQueuePositions([]queuedMsg{
+		{chatID: "tg:1", msgID: "user-1", progressID: "q1"},
+		{chatID: "tg:1", msgID: "user-2", progressID: "q2"},
+		{chatID: "tg:1"}, // no progressID — nothing to edit for this one
+	})
+
+	if tp.editCalls != 2 {
+		t.Fatalf("expected 2 position edits, got %d", tp.editCalls)
+	}
+	wantPos := map[string]string{"q1": "⏳ В очереди: 1", "q2": "⏳ В очереди: 2"}
+	wantReply := map[string]string{"q1": "user-1", "q2": "user-2"}
+	for i, call := range tp.editLog {
+		want, ok := wantPos[call.message]
+		if !ok {
+			t.Fatalf("unexpected message id in edit %d: %q", i, call.message)
+		}
+		if call.text != want {
+			t.Fatalf("edit %d (message %q) text = %q, want %q", i, call.message, call.text, want)
+		}
+		// The placeholder was created as a reply to its own message — the
+		// position-update edit must resend that same replyTo.
+		if call.replyTo != wantReply[call.message] {
+			t.Fatalf("edit %d (message %q) replyTo = %q, want %q", i, call.message, call.replyTo, wantReply[call.message])
 		}
 	}
 }

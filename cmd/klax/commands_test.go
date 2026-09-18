@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/PiDmitrius/klax/internal/config"
 	"github.com/PiDmitrius/klax/internal/runner"
 	"github.com/PiDmitrius/klax/internal/session"
 )
@@ -116,6 +117,106 @@ func TestAbortSessionDetectsProcessingAndFlagsClosing(t *testing.T) {
 	}
 }
 
+func TestCreateSessionUsesUserDefaultCWD(t *testing.T) {
+	userCWD := t.TempDir()
+	st := &session.Store{
+		Chats: make(map[string]*session.ChatSessions),
+		Scope: make(map[string]*session.ScopeDefaults),
+	}
+	d := &daemon{
+		cfg: &config.Config{
+			DefaultCWD: "/tmp/global",
+			Users: []config.UserIdentity{
+				{ID: "alice", CWD: userCWD},
+			},
+		},
+		store: st,
+	}
+
+	sess, _ := d.createSession("ui:alice", "user:alice", "main")
+
+	if sess.CWD != userCWD {
+		t.Fatalf("session cwd = %q, want user default", sess.CWD)
+	}
+}
+
+func TestCreateSessionFallsBackWhenUserDefaultCWDIsInvalid(t *testing.T) {
+	globalCWD := t.TempDir()
+	st := &session.Store{
+		Chats: make(map[string]*session.ChatSessions),
+		Scope: make(map[string]*session.ScopeDefaults),
+	}
+	d := &daemon{
+		cfg: &config.Config{
+			DefaultCWD: globalCWD,
+			Users: []config.UserIdentity{
+				{ID: "alice", CWD: "/no/such/klax/cwd"},
+			},
+		},
+		store: st,
+	}
+
+	sess, _ := d.createSession("ui:alice", "user:alice", "main")
+
+	if sess.CWD != globalCWD {
+		t.Fatalf("session cwd = %q, want global fallback", sess.CWD)
+	}
+}
+
+func TestEnsureSessionUsesUserDefaultOnlyForNewSession(t *testing.T) {
+	userCWD := t.TempDir()
+	t.Setenv("KLAX_DATA_DIR", t.TempDir())
+	st, err := session.LoadStore()
+	if err != nil {
+		t.Fatalf("LoadStore: %v", err)
+	}
+	d := &daemon{
+		cfg: &config.Config{
+			DefaultCWD: "/tmp/global",
+			Users: []config.UserIdentity{
+				{ID: "alice", CWD: userCWD},
+			},
+		},
+		store: st,
+	}
+
+	d.ensureSessionWithCWD("user:alice", "")
+	sess := st.Active("user:alice")
+	if sess == nil || sess.CWD != userCWD {
+		t.Fatalf("new session = %+v, want user cwd", sess)
+	}
+
+	st.UpdateActive("user:alice", func(sess *session.Session) {
+		sess.CWD = "/tmp/custom-session"
+	})
+	d.ensureSessionWithCWD("user:alice", "")
+	sess = st.Active("user:alice")
+	if sess.CWD != "/tmp/custom-session" {
+		t.Fatalf("existing session cwd = %q, want preserved custom cwd", sess.CWD)
+	}
+}
+
+// A brand-new session (none active yet) must prefer an explicit ScopeDefaults.CWD over
+// whatever forceCWD the caller derived — otherwise a chat whose sessions were all deleted
+// loses its /cwd default the moment the next message recreates one.
+func TestEnsureSessionWithCWDPrefersScopeDefaultOverForceCWD(t *testing.T) {
+	userCWD := t.TempDir()
+	t.Setenv("KLAX_DATA_DIR", t.TempDir())
+	st, err := session.LoadStore()
+	if err != nil {
+		t.Fatalf("LoadStore: %v", err)
+	}
+	d := &daemon{cfg: &config.Config{DefaultCWD: "/tmp/global"}, store: st}
+	st.UpdateScopeDefaults("user:alice", func(def *session.ScopeDefaults) { def.CWD = userCWD })
+
+	d.ensureSessionWithCWD("user:alice", "/tmp/some-other-forced-cwd")
+
+	sess := st.Active("user:alice")
+	if sess == nil || sess.CWD != userCWD {
+		t.Fatalf("new session = %+v, want ScopeDefaults.CWD %q to win over forceCWD", sess, userCWD)
+	}
+}
+
 func TestNormalizeCommandGroupAliases(t *testing.T) {
 	tests := []struct {
 		inCmd   string
@@ -160,6 +261,56 @@ func TestNormalizeCommandVerboseAliases(t *testing.T) {
 	}
 }
 
+func TestNormalizeCommandAttachmentsAliases(t *testing.T) {
+	for _, tt := range []struct {
+		inCmd, wantArg string
+	}{
+		{inCmd: "/attachments_on", wantArg: "on"},
+		{inCmd: "/attachments_off", wantArg: "off"},
+		{inCmd: "/attachments_any", wantArg: "any"},
+	} {
+		gotCmd, gotArgs := normalizeCommand(tt.inCmd, nil)
+		if gotCmd != "/attachments" || len(gotArgs) != 1 || gotArgs[0] != tt.wantArg {
+			t.Fatalf("%s normalized to %q %v, want /attachments %s", tt.inCmd, gotCmd, gotArgs, tt.wantArg)
+		}
+	}
+}
+
+func TestAttachmentsAnyCommandPersistsMode(t *testing.T) {
+	d := newTestDaemon(t)
+	chatID := "ym:0/0/group"
+	sk := d.sessionKey(chatID)
+	d.groupChats[chatID] = t.TempDir()
+	d.store.Ensure(sk, "group", t.TempDir(), d.fallbackScopeDefaults())
+
+	d.handleCommand(chatID, "m1", "/attachments any")
+
+	if got := d.groupAttachmentMode(chatID); got != "any" {
+		t.Fatalf("/attachments any left mode %q, want any", got)
+	}
+}
+
+func TestSandboxAnyIsRejected(t *testing.T) {
+	d := newTestDaemon(t)
+	chatID := "tg:test"
+	sk := d.sessionKey(chatID)
+	d.store.Ensure(sk, "default", t.TempDir(), d.fallbackScopeDefaults())
+
+	d.handleCommand(chatID, "m1", "/sandbox any")
+
+	if got := d.store.Active(sk).Sandbox; got == "any" {
+		t.Fatal("/sandbox any must not persist an unsupported sandbox mode")
+	}
+}
+
+func TestAttachmentsCommandsRequireAllowListedGroupUser(t *testing.T) {
+	for _, command := range []string{"/attachments", "/attachments any", "/attachments_any"} {
+		if isGroupCommand(command) {
+			t.Fatalf("%q must not be available to a non-allow-listed group member", command)
+		}
+	}
+}
+
 func TestNormalizeCommandTTYAliases(t *testing.T) {
 	tests := []struct {
 		inCmd   string
@@ -181,29 +332,104 @@ func TestNormalizeCommandTTYAliases(t *testing.T) {
 	}
 }
 
-func TestExpandBypassUnderscore(t *testing.T) {
-	tests := []struct {
-		in, want string
-	}{
-		{"/bypass_ping", "/bypass ping"},
-		{"/bypass_ping arg2", "/bypass ping arg2"},
-		{"/bypass_ping@klaxbot arg", "/bypass ping arg"},
-		{"/BYPASS_PING", "/bypass PING"},
-		{"/bypass ping", "/bypass ping"},
-		{"/bypass", "/bypass"},
-		{"/bypass_", "/bypass_"},
-		{"/sessions@klaxbot", "/sessions@klaxbot"},
-		{"/prompt_foo", "/prompt_foo"},
-	}
-	for _, tt := range tests {
-		if got := expandBypassUnderscore(tt.in); got != tt.want {
-			t.Errorf("expandBypassUnderscore(%q) = %q, want %q", tt.in, got, tt.want)
-		}
-	}
-}
-
 func TestAbortReplyText(t *testing.T) {
 	if abortReplyText != "❌ Прерваны все сообщения в сессии." {
 		t.Fatalf("abortReplyText = %q", abortReplyText)
+	}
+}
+
+func TestCWDCommandBecomesNewSessionDefault(t *testing.T) {
+	d := newTestDaemon(t)
+	chatID := "tg:test"
+	sk := d.sessionKey(chatID)
+	d.store.Ensure(sk, "default", t.TempDir(), d.fallbackScopeDefaults())
+
+	newCWD := t.TempDir()
+	d.handleCommand(chatID, "m1", "/cwd "+newCWD)
+
+	if got := d.store.Active(sk).CWD; got != newCWD {
+		t.Fatalf("active session CWD = %q, want %q", got, newCWD)
+	}
+	if got := d.scopeDefaults(sk).CWD; got != newCWD {
+		t.Fatalf("scope defaults CWD = %q, want %q — /cwd should become the default for the next session, like /backend", got, newCWD)
+	}
+
+	// /new should pick up the /cwd override, not some other stale default.
+	sess, _ := d.createSession(chatID, sk, "second")
+	if sess.CWD != newCWD {
+		t.Fatalf("new session CWD = %q, want the /cwd override %q", sess.CWD, newCWD)
+	}
+}
+
+// /groups on must resolve cwd the same way createSession does (ScopeDefaults.CWD first) —
+// otherwise it resurrects the group's stale original registry cwd over a /cwd override made
+// before the group was ever toggled on, desyncing Session.CWD from ScopeDefaults.CWD again.
+func TestGroupsOnUsesScopeDefaultsCWDNotStaleRegistry(t *testing.T) {
+	d := newTestDaemon(t)
+	d.cfg.DefaultCWD = t.TempDir()
+	chatID := "tg:-1001"
+	sk := d.sessionKey(chatID)
+
+	originalCWD := d.sessionCWD(chatID)
+	d.enableGroupChat(chatID, originalCWD)
+	d.store.Ensure(sk, "default", originalCWD, d.fallbackScopeDefaults())
+
+	// Simulate /cwd <newdir> before the first message: Session.CWD and ScopeDefaults.CWD change,
+	// the groupChats registry (only ever seeded once) is left holding the stale original.
+	newCWD := t.TempDir()
+	d.store.UpdateActive(sk, func(sess *session.Session) { sess.CWD = newCWD })
+	d.store.UpdateScopeDefaults(sk, func(def *session.ScopeDefaults) { def.CWD = newCWD })
+
+	d.handleCommand(chatID, "m1", "/groups on")
+
+	if got := d.groupCWD(chatID); got != newCWD {
+		t.Fatalf("group registry CWD = %q after /groups on, want the /cwd override %q (not stale %q)", got, newCWD, originalCWD)
+	}
+	if got := d.store.Active(sk).CWD; got != newCWD {
+		t.Fatalf("active session CWD = %q after /groups on, want %q — must not resurrect the stale registry cwd", got, newCWD)
+	}
+}
+
+// /groups on must judge "is there already a session with the group's cwd" by the
+// CURRENTLY ACTIVE session, not any historical (now inactive) one — otherwise it can
+// leave an unrelated active session in place while the group registry points
+// elsewhere, a divergence nothing reconciles afterward since Store no longer
+// re-derives an active session's CWD on its own.
+func TestGroupsOnReplacesActiveSessionWhenItDoesNotMatchGroupCWD(t *testing.T) {
+	d := newTestDaemon(t)
+	d.cfg.DefaultCWD = t.TempDir()
+	chatID := "tg:-1002"
+	sk := d.sessionKey(chatID)
+
+	groupCWD := d.sessionCWD(chatID)
+	d.enableGroupChat(chatID, groupCWD)
+	d.store.New(sk, "group", groupCWD, d.fallbackScopeDefaults())
+
+	// A second session (e.g. from the Web UI) takes over as active with an unrelated
+	// cwd, leaving the first (matching the group's cwd) inactive but not deleted.
+	otherCWD := t.TempDir()
+	d.store.New(sk, "other", otherCWD, d.fallbackScopeDefaults())
+
+	d.handleCommand(chatID, "m1", "/groups on")
+
+	active := d.store.Active(sk)
+	if active == nil || active.CWD != groupCWD {
+		t.Fatalf("active session after /groups on = %+v, want CWD=%q (the group's), not left on the unrelated %q",
+			active, groupCWD, otherCWD)
+	}
+}
+
+func TestCWDCommandLocksAfterFirstMessage(t *testing.T) {
+	d := newTestDaemon(t)
+	chatID := "tg:test"
+	sk := d.sessionKey(chatID)
+	originalCWD := t.TempDir()
+	d.store.Ensure(sk, "default", originalCWD, d.fallbackScopeDefaults())
+	d.store.UpdateActive(sk, func(sess *session.Session) { sess.Messages = 1 })
+
+	d.handleCommand(chatID, "m1", "/cwd "+t.TempDir())
+
+	if got := d.store.Active(sk).CWD; got != originalCWD {
+		t.Fatalf("session CWD = %q after /cwd on a started session, want it to stay %q (locked, like /backend)", got, originalCWD)
 	}
 }

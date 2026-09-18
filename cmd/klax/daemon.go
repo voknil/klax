@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,18 +21,28 @@ import (
 
 	"github.com/PiDmitrius/klax/internal/claudetty/hook"
 	"github.com/PiDmitrius/klax/internal/config"
+	"github.com/PiDmitrius/klax/internal/inbound"
 	"github.com/PiDmitrius/klax/internal/max"
 	"github.com/PiDmitrius/klax/internal/runner"
+	"github.com/PiDmitrius/klax/internal/sessfiles"
 	"github.com/PiDmitrius/klax/internal/session"
 	"github.com/PiDmitrius/klax/internal/tg"
 	"github.com/PiDmitrius/klax/internal/transport"
+	"github.com/PiDmitrius/klax/internal/turnaudit"
 	"github.com/PiDmitrius/klax/internal/vk"
+	"github.com/PiDmitrius/klax/internal/ym"
 )
 
 // sessionRunner holds a per-session runner and message queue.
 // Different sessions run Claude in parallel; within a session, messages are serialized.
 type sessionRunner struct {
-	runner     *runner.Runner
+	runner   *runner.Runner
+	acceptMu sync.Mutex          // serializes acceptance and boundary registration with queue clearing
+	results  map[int64]*turnWait // guarded by mu
+	// store is the per-session durable store (files + queue.jsonl). One instance
+	// per (sessionKey, created), owned here so its lock is a true per-session
+	// singleton — distinct from sr.mu and never held across a runner wait.
+	store      *sessfiles.Store
 	mu         sync.Mutex
 	queue      []queuedMsg
 	processing bool
@@ -51,29 +63,46 @@ type runnerKey struct {
 }
 
 type daemon struct {
-	cfg           *config.Config
-	state         *session.State
-	transports    map[string]transport.Transport // "tg" -> tg.Bot, "mx" -> max.Bot
-	formats       map[string]string              // "tg" -> "html", "vk" -> ""
-	disabled      map[string]bool                // disabled transports
-	pollCtx       map[string]context.CancelFunc  // cancel functions for poll goroutines
-	sources       map[string]Source              // inbound channels by name (tg/mx/vk/ui)
-	store         *session.Store
-	runners       map[runnerKey]*sessionRunner // (sessionKey, created) -> runner+queue
-	runnersMu     sync.Mutex
-	mu            sync.Mutex
-	draining      bool           // stop accepting new tasks, wait for current to finish
-	drainWg       sync.WaitGroup // tracks active sessionRunners for drain
-	sendPause     map[string]time.Time
-	sendFails     map[string]int
-	chatEvents    map[string]uint64
-	identities    map[int64]string  // telegram userID -> canonical user ID
-	maxIdents     map[int64]string  // max userID -> canonical user ID
-	vkIdents      map[int]string    // vk userID -> canonical user ID
-	groupChats    map[string]string // chatID -> CWD for group mode chats
-	groupVerb     map[string]bool   // chatID -> verbose progress output for group mode chats
-	tgRich        atomic.Bool       // global: render Telegram replies as Rich Messages (/rich)
-	uiHub         *uiHub            // web UI event hub; nil when the UI is not configured
+	cfg          *config.Config
+	state        *session.State
+	transports   map[string]transport.Transport // "tg" -> tg.Bot, "mx" -> max.Bot
+	formats      map[string]string              // "tg" -> "html", "vk" -> ""
+	disabled     map[string]bool                // disabled transports
+	pollCtx      map[string]context.CancelFunc  // cancel functions for poll goroutines
+	sources      map[string]Source              // inbound channels by name (tg/mx/vk/ui)
+	handshakes   map[string]func() error        // per-transport readiness check, re-run by /transports on
+	connecting   map[string]bool                // handshakes in flight, so connect stays single-flight
+	store        *session.Store
+	runners      map[runnerKey]*sessionRunner // (sessionKey, created) -> runner+queue
+	runnersMu    sync.Mutex
+	mu           sync.Mutex
+	draining     bool           // stop accepting new tasks, wait for current to finish
+	drainWg      sync.WaitGroup // tracks active sessionRunners for drain
+	sendPause    map[string]time.Time
+	sendFails    map[string]int
+	chatEvents   map[string]uint64
+	identities   map[int64]string               // telegram userID -> canonical user ID
+	maxIdents    map[int64]string               // max userID -> canonical user ID
+	vkIdents     map[int]string                 // vk userID -> canonical user ID
+	ymIdents     map[string]string              // ym login (lowercased) -> canonical user ID
+	groupChats   map[string]string              // chatID -> CWD for group mode chats
+	groupVerb    map[string]bool                // chatID -> verbose progress output for group mode chats
+	tgRich       atomic.Bool                    // global: render Telegram replies as Rich Messages (/rich)
+	uiHub        *uiHub                         // web UI event hub; nil when the UI is not configured (also the "UI on" gate)
+	system       *systemState                   // process/update status shared by all authenticated UI users
+	startupKind  string                         // installed|started — derived once from the startup marker
+	fileTokens   map[string]tokenRef            // durable per-file access token -> its (session, stored file)
+	fileTokensMu sync.Mutex                     // rebuilt from each session's links.json at startup
+	sessStores   map[runnerKey]*sessfiles.Store // ONE canonical durable Store per (sk,created)
+	sessStoresMu sync.Mutex                     // shared by runner/read-model/file-links/delete
+}
+
+// tokenRef locates the file a durable access token addresses. The token itself lives in the session's
+// links.json (stable across rebuilds/restarts); this in-memory index resolves it at serve time.
+type tokenRef struct {
+	sk      string
+	created int64
+	stored  string
 }
 
 func startupBackoff(attempt int) time.Duration {
@@ -87,13 +116,106 @@ func startupBackoff(attempt int) time.Duration {
 	return d
 }
 
+// connectTransport runs one transport's startup handshake in the background and starts its poll loop
+// when it succeeds. A transient failure retries forever; a permanent one (bad or revoked token)
+// abandons this transport's connection attempt and leaves the rest of the daemon running.
+func connectTransport(name string, handshake func() error, onReady, onDone func()) {
+	go func() {
+		if onDone != nil {
+			defer onDone()
+		}
+		for attempt := 0; ; attempt++ {
+			err := handshake()
+			if err == nil {
+				onReady()
+				return
+			}
+			if isPermanentStartupError(err) {
+				log.Printf("[FAIL] %s not connected: %v — other transports are unaffected", name, err)
+				return
+			}
+			wait := connectBackoff(attempt)
+			log.Printf("%s unreachable: %v (retry in %v)", name, err, wait)
+			time.Sleep(wait)
+		}
+	}()
+}
+
+// announceStartup tells the messengers the daemon is up, without waiting: a send retries for up to
+// sendTimeout per user against an unreachable platform, and nothing on the startup path may block on
+// that. The UI reads the same fact from /api/tail.
+func (d *daemon) announceStartup(text string) { go d.notifyAllUsers(text) }
+
+// connect runs a transport's readiness check in the background and starts its poll loop when it
+// succeeds. Used at startup and by `/transports on`, so enabling always revalidates.
+//
+// Idempotent, and that is load-bearing: the handshake drains the platform's pending updates, which
+// DISCARDS them. Re-running it against a transport that is already polling would eat live messages
+// and mutate the bot's cursor underneath its own poll loop.
+func (d *daemon) connect(name string) {
+	d.mu.Lock()
+	h := d.handshakes[name]
+	_, polling := d.pollCtx[name]
+	if h == nil || polling || d.connecting[name] {
+		d.mu.Unlock()
+		return
+	}
+	d.connecting[name] = true
+	d.mu.Unlock()
+
+	connectTransport(name, h, func() { d.startPoll(name) }, func() {
+		d.mu.Lock()
+		delete(d.connecting, name)
+		d.mu.Unlock()
+	})
+}
+
+// connectBackoff is a variable so tests can shorten the schedule.
+var connectBackoff = startupBackoff
+
+// secretRes match credentials a transport error can quote back: Go's http client puts the full
+// request URL in its error text, and a token may sit in the path or in a query parameter. The bot
+// ID before the colon is public identity, not a credential, so it is kept.
+var secretRes = []struct {
+	re   *regexp.Regexp
+	repl string
+}{
+	{regexp.MustCompile(`(?i)(bot\d{5,}):[A-Za-z0-9_-]{10,}`), "$1:<redacted>"},                      // /bot<id>:<secret>/
+	{regexp.MustCompile(`(?i)\b((?:access_|api_)?(?:token|key|secret))=[^&\s"']+`), "$1=<redacted>"}, // ?access_token=<secret>
+}
+
+// redactSecrets strips credentials from a string before it is logged. Patterns are deliberately
+// narrow so ordinary text ("bottlenecks", "token bucket") is left intact.
+func redactSecrets(s string) string {
+	for _, p := range secretRes {
+		s = p.re.ReplaceAllString(s, p.repl)
+	}
+	return s
+}
+
+// redactingWriter is the single chokepoint every log line passes through, so no call site has to
+// remember to redact.
+type redactingWriter struct{ w io.Writer }
+
+func (rw redactingWriter) Write(p []byte) (int, error) {
+	clean := redactSecrets(string(p))
+	if clean == string(p) {
+		return rw.w.Write(p)
+	}
+	// Report the caller's length: a short count reads as a write error to log.Output.
+	if _, err := rw.w.Write([]byte(clean)); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
 func isPermanentStartupError(err error) bool {
 	var apiErr *transport.APIError
 	if !errors.As(err, &apiErr) {
 		return false
 	}
 	switch apiErr.Platform {
-	case "tg", "max":
+	case "tg", "max", "ym":
 		return apiErr.Code == 400 || apiErr.Code == 401 || apiErr.Code == 403
 	case "vk":
 		return apiErr.Code == 5 || apiErr.Code == 15
@@ -103,13 +225,13 @@ func isPermanentStartupError(err error) bool {
 }
 
 func hasConfiguredTransport(cfg *config.Config) bool {
-	if cfg.TelegramToken != "" || cfg.MaxToken != "" || cfg.VKToken != "" {
+	if cfg.TelegramToken != "" || cfg.MaxToken != "" || cfg.VKToken != "" || cfg.YmToken != "" {
 		return true
 	}
 	// The web UI can be the only configured channel.
 	if cfg.UIListen != "" {
 		for _, u := range cfg.Users {
-			if u.UIToken != "" {
+			if u.UIToken != "" || u.UIReadToken != "" {
 				return true
 			}
 		}
@@ -159,8 +281,12 @@ func (d *daemon) getRunner(sk string, created int64) *sessionRunner {
 	defer d.runnersMu.Unlock()
 	sr, ok := d.runners[key]
 	if !ok {
-		sr = &sessionRunner{runner: runner.New()}
+		sr = &sessionRunner{runner: runner.New(), store: d.sessionStore(sk, created)}
 		d.runners[key] = sr
+	} else if sr.store == nil {
+		// A runner injected without a store (only happens in tests that pre-populate
+		// d.runners directly) gets the CANONICAL one, so the durable-queue path never nils.
+		sr.store = d.sessionStore(sk, created)
 	}
 	return sr
 }
@@ -180,6 +306,37 @@ func (d *daemon) dropRunner(sk string, created int64) {
 	d.runnersMu.Lock()
 	delete(d.runners, runnerKey{sk: sk, created: created})
 	d.runnersMu.Unlock()
+}
+
+// sessionStore returns the ONE canonical durable Store for a session — the SAME *sessfiles.Store
+// instance for every caller (runner, read model, file links, delete). This is essential: a Store's
+// mutex and its `removed` latch are per-instance, so if different callers used separate Open()'d
+// instances, a late EnsureLink/Enqueue on one could re-create a directory another had just RemoveAll'd
+// (resurrection). Kept even after Remove — the removed instance's latch is what makes any late call
+// return ErrRemoved instead of resurrecting; a fresh Open would have a clean latch. The registry is
+// keyed by (sk,created), which is unique-and-never-reused, so it grows only with distinct sessions.
+func (d *daemon) sessionStore(sk string, created int64) *sessfiles.Store {
+	key := runnerKey{sk: sk, created: created}
+	d.sessStoresMu.Lock()
+	defer d.sessStoresMu.Unlock()
+	if d.sessStores == nil {
+		d.sessStores = make(map[runnerKey]*sessfiles.Store)
+	}
+	st, ok := d.sessStores[key]
+	if !ok {
+		st = sessfiles.Open(sk, created)
+		d.sessStores[key] = st
+	}
+	return st
+}
+
+// removeSessionStore deletes a session's durable dir (files/ + queue.jsonl + links.json). It removes
+// via the CANONICAL store (sessionStore), so the `removed` latch lands on the one instance every other
+// caller shares — a late Enqueue/Mark*/EnsureLink then returns ErrRemoved instead of resurrecting the
+// dir. The instance stays in the registry so that latch keeps protecting it.
+func (d *daemon) removeSessionStore(sk string, created int64) {
+	_ = d.sessionStore(sk, created).Remove()
+	d.dropFileTokens(sk, created) // the session dir (files/ + links.json) is gone — forget its tokens
 }
 
 // isSessionBusy reports whether the session has work in flight or queued.
@@ -266,6 +423,15 @@ func (d *daemon) sessionKey(chatID string) string {
 					}
 				}
 			}
+		case "ym":
+			// ym DMs are addressed by login ("vasya@example.org"), groups/channels
+			// by chat_id ("0/0/<guid>") — ym.IsLogin/IsGroup is the single source
+			// of truth for telling them apart (see internal/ym).
+			if ym.IsLogin(raw) {
+				if canonical, ok := d.ymIdents[strings.ToLower(raw)]; ok {
+					return "user:" + canonical
+				}
+			}
 		case "ui":
 			// The UI authenticates as a canonical user, so raw is already that
 			// id. Share the session list with tg/mx/vk DMs for the same person.
@@ -284,17 +450,24 @@ type attachment struct {
 }
 
 type queuedMsg struct {
-	chatID      string
-	msgID       string // user's message ID (for replyTo)
-	text        string
-	progressID  string // ID of "В очереди" message to reuse as progress
-	progressSeq uint64 // chat activity right after the queue message was created
-	attachments []attachment
+	completion   *turnWait
+	chatID       string
+	msgID        string // user's message ID (for replyTo)
+	text         string
+	originalText string
+	progressID   string // ID of "В очереди" message to reuse as progress
+	progressSeq  uint64 // chat activity right after the queue message was created
+	// Durable-queue references (the bytes live in the session's durable store, not
+	// here): turnSeq is the queue/turn id, files are stored names under files/, and
+	turnSeq int64
+	files   []string
 	// sessKey + sessCreated identify the session this message is bound to.
 	// Captured at enqueue time so subsequent /switch or /new cannot redirect
 	// it to a different session.
 	sessKey     string
 	sessCreated int64
+	acceptedAt  int64
+	origin      inbound.Origin
 }
 
 // ensurePath makes sure PATH includes the directory of the running binary.
@@ -332,80 +505,29 @@ func runDaemon() {
 		log.Fatal("no tokens configured. Run 'klax setup'.")
 	}
 
+	// Constructing a bot does no I/O: every configured transport is registered before any network
+	// call happens. Readiness is established later, per transport, by connectTransport.
 	transports := make(map[string]transport.Transport)
 
-	// --- Telegram ---
 	var tgBot *tg.Bot
 	if cfg.TelegramToken != "" {
 		tgBot = tg.New(cfg.TelegramToken)
-		for attempt := 0; ; attempt++ {
-			err := tgBot.GetMe()
-			if err == nil {
-				if err := tgBot.DrainUpdates(); err != nil {
-					log.Printf("warning: tg drain updates: %v", err)
-				}
-				tgBot.SetMyCommands(tgMenuCommands)
-				break
-			}
-			if isPermanentStartupError(err) {
-				log.Fatalf("telegram auth failed: %v", err)
-			}
-			wait := startupBackoff(attempt)
-			log.Printf("telegram unreachable: %v (retry in %v)", err, wait)
-			time.Sleep(wait)
-		}
 		transports["tg"] = tgBot
-		log.Println("[OK] Telegram connected")
 	}
-
-	// --- MAX ---
 	var maxBot *max.Bot
 	if cfg.MaxToken != "" {
 		maxBot = max.New(cfg.MaxToken)
-		var me *max.User
-		for attempt := 0; ; attempt++ {
-			var err error
-			me, err = maxBot.GetMe()
-			if err == nil {
-				break
-			}
-			if isPermanentStartupError(err) {
-				log.Fatalf("MAX auth failed: %v", err)
-			}
-			wait := startupBackoff(attempt)
-			log.Printf("MAX unreachable: %v (retry in %v)", err, wait)
-			time.Sleep(wait)
-		}
-		if err := maxBot.DrainUpdates(); err != nil {
-			log.Printf("warning: max drain updates: %v", err)
-		}
 		transports["mx"] = maxBot
-		log.Printf("[OK] MAX bot: [%d] %s (@%s)", me.UserID, me.Name, me.Username)
 	}
-
-	// --- VK ---
 	var vkBot *vk.Bot
 	if cfg.VKToken != "" {
 		vkBot = vk.New(cfg.VKToken)
-		var group *vk.GroupInfo
-		for attempt := 0; ; attempt++ {
-			var err error
-			group, err = vkBot.GetMe()
-			if err == nil {
-				break
-			}
-			if isPermanentStartupError(err) {
-				log.Fatalf("VK auth failed: %v", err)
-			}
-			wait := startupBackoff(attempt)
-			log.Printf("VK unreachable: %v (retry in %v)", err, wait)
-			time.Sleep(wait)
-		}
-		if err := vkBot.DrainUpdates(); err != nil {
-			log.Printf("warning: vk drain updates: %v", err)
-		}
 		transports["vk"] = vkBot
-		log.Printf("[OK] VK group: [%d] %s", group.ID, group.Name)
+	}
+	var ymBot *ym.Bot
+	if cfg.YmToken != "" {
+		ymBot = ym.New(cfg.YmToken)
+		transports["ym"] = ymBot
 	}
 
 	store, err := session.LoadStore()
@@ -417,6 +539,7 @@ func runDaemon() {
 	tgIdents := make(map[int64]string)
 	maxIdents := make(map[int64]string)
 	vkIdents := make(map[int]string)
+	ymIdents := make(map[string]string)
 	for _, u := range cfg.Users {
 		if u.TelegramID != 0 {
 			tgIdents[u.TelegramID] = u.ID
@@ -426,6 +549,9 @@ func runDaemon() {
 		}
 		if u.VKID != 0 {
 			vkIdents[int(u.VKID)] = u.ID
+		}
+		if u.YmLogin != "" {
+			ymIdents[strings.ToLower(u.YmLogin)] = u.ID
 		}
 	}
 
@@ -459,6 +585,9 @@ func runDaemon() {
 		if u.VKID != 0 {
 			oldKeys = append(oldKeys, fmt.Sprintf("vk:%d", u.VKID))
 		}
+		if u.YmLogin != "" {
+			oldKeys = append(oldKeys, fmt.Sprintf("ym:%s", u.YmLogin))
+		}
 		if store.MergeKeys(targetKey, oldKeys) {
 			if err := store.Save(); err != nil {
 				log.Printf("save sessions: %v", err)
@@ -474,16 +603,41 @@ func runDaemon() {
 
 	groupChats := make(map[string]string)
 	groupVerb := make(map[string]bool)
+	configuredGroups := cfg.GroupChats[:0]
+	threadGroupsMigrated := false
 	for _, gc := range cfg.GroupChats {
+		if isYMThreadChatID(gc.ID) {
+			enabled := true
+			verbose := gc.Verbose == nil || *gc.Verbose
+			store.UpdateScopeDefaults(gc.ID, func(def *session.ScopeDefaults) {
+				def.GroupMode = &enabled
+				def.GroupVerbose = &verbose
+				if def.CWD == "" {
+					def.CWD = gc.CWD
+				}
+			})
+			threadGroupsMigrated = true
+			continue
+		}
+		configuredGroups = append(configuredGroups, gc)
 		groupChats[gc.ID] = gc.CWD
 		groupVerb[gc.ID] = gc.Verbose == nil || *gc.Verbose
+	}
+	if threadGroupsMigrated {
+		cfg.GroupChats = configuredGroups
+		if err := store.Save(); err != nil {
+			log.Printf("save migrated YM thread state: %v", err)
+		}
+		if err := config.Save(cfg); err != nil {
+			log.Printf("remove migrated YM threads from config: %v", err)
+		}
 	}
 
 	d := &daemon{
 		cfg:        cfg,
 		state:      session.LoadState(),
 		transports: transports,
-		formats:    map[string]string{"tg": "html", "mx": "html", "vk": ""},
+		formats:    map[string]string{"tg": "html", "mx": "html", "vk": "", "ym": ""},
 		disabled:   disabled,
 		pollCtx:    make(map[string]context.CancelFunc),
 		store:      store,
@@ -494,13 +648,14 @@ func runDaemon() {
 		identities: tgIdents,
 		maxIdents:  maxIdents,
 		vkIdents:   vkIdents,
+		ymIdents:   ymIdents,
 		groupChats: groupChats,
 		groupVerb:  groupVerb,
 	}
 
 	d.tgRich.Store(cfg.TelegramRich)
 
-	// Register inbound sources. tg/mx/vk are the legacy poll loops wrapped as
+	// Register inbound sources. tg/mx/vk/ym are the legacy poll loops wrapped as
 	// Sources; the web UI registers itself here too when configured.
 	d.sources = map[string]Source{}
 	if tgBot != nil {
@@ -512,6 +667,9 @@ func runDaemon() {
 	if vkBot != nil {
 		d.sources["vk"] = &legacySource{name: "vk", poll: d.pollVK}
 	}
+	if ymBot != nil {
+		d.sources["ym"] = &legacySource{name: "ym", poll: d.pollYM}
+	}
 
 	// Web UI source (HTTP/SSE), gated by config. It joins the same canonical
 	// user identity, so its tabs share sessions with the messengers.
@@ -522,6 +680,7 @@ func runDaemon() {
 		}
 		if len(uiTokens) > 0 {
 			d.uiHub = newUIHub()
+			d.rebuildFileTokenIndex() // load every session's links.json so existing tokens resolve at once
 			d.transports["ui"] = &uiTransport{d: d}
 			d.formats["ui"] = ""
 			d.sources["ui"] = &uiServer{d: d, addr: cfg.UIListen, tokens: uiTokens}
@@ -531,21 +690,15 @@ func runDaemon() {
 	writePID()
 	log.Printf("klax %s started (pid %d)", version, os.Getpid())
 
-	// Startup notification: if restart marker exists, notify users we're back.
-	if m := readMarker(); m != nil {
-		var text string
-		switch m.Reason {
-		case "update":
-			text = fmt.Sprintf("✅ klax обновлён (v%s)", version)
-		default:
-			text = fmt.Sprintf("✅ klax перезапущен (v%s)", version)
-		}
-		// Messengers get the restart banner here; UI clients show their own notice
-		// on the epoch change their next poll observes (handlePoll/pollLoop).
-		d.notifyAllUsers(text)
+	// The marker distinguishes a completed install from every other kind of process start.
+	// Keep that fact in the new process after removing the marker so every UI tab reads the same
+	// canonical startup outcome from /api/tail instead of inferring it from browser-local state.
+	m := readMarker()
+	startupKind, text := startupNotice(m)
+	d.startupKind = startupKind
+	if m != nil {
 		removeMarker()
 	}
-
 	// Handle SIGTERM/SIGINT for graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
@@ -558,27 +711,108 @@ func runDaemon() {
 	// Watch for restart marker (runs after startup marker is cleared).
 	go d.watchMarker()
 
-	// Start polling loops for enabled transports.
-	if tgBot != nil && !disabled["tg"] {
-		d.startPoll("tg")
+	// Re-enqueue durably-accepted messages left by a previous run (a crash or an
+	// accept-during-drain restart) before any transport starts taking new traffic.
+	d.replayDurableQueues()
+
+	// A transport's readiness check is kept on the daemon so `/transports on` re-runs it instead of
+	// starting a raw poll loop against credentials that were never validated. Built COMPLETE before
+	// anything can serve a command, so it is write-once-then-read-only and needs no lock.
+	d.handshakes = map[string]func() error{}
+	d.connecting = map[string]bool{}
+	if tgBot != nil {
+		d.handshakes["tg"] = func() error {
+			me, err := tgBot.GetMe()
+			if err != nil {
+				return err
+			}
+			if err := tgBot.DrainUpdates(); err != nil {
+				log.Printf("warning: tg drain updates: %v", err)
+			}
+			tgBot.SetMyCommands(tgMenuCommands)
+			registerSelfMentionTrigger(me.Username)
+			log.Printf("[OK] Telegram bot: @%s", me.Username)
+			return nil
+		}
 	}
-	if maxBot != nil && !disabled["mx"] {
-		d.startPoll("mx")
+	if maxBot != nil {
+		d.handshakes["mx"] = func() error {
+			me, err := maxBot.GetMe()
+			if err != nil {
+				return err
+			}
+			if err := maxBot.DrainUpdates(); err != nil {
+				log.Printf("warning: max drain updates: %v", err)
+			}
+			log.Printf("[OK] MAX bot: [%d] %s (@%s)", me.UserID, me.Name, me.Username)
+			return nil
+		}
 	}
-	if vkBot != nil && !disabled["vk"] {
-		d.startPoll("vk")
+	if vkBot != nil {
+		d.handshakes["vk"] = func() error {
+			group, err := vkBot.GetMe()
+			if err != nil {
+				return err
+			}
+			if err := vkBot.DrainUpdates(); err != nil {
+				log.Printf("warning: vk drain updates: %v", err)
+			}
+			log.Printf("[OK] VK group: [%d] %s", group.ID, group.Name)
+			return nil
+		}
 	}
+	if ymBot != nil {
+		d.handshakes["ym"] = func() error {
+			me, err := ymBot.GetMe()
+			if err != nil {
+				return err
+			}
+			if err := ymBot.DrainUpdates(); err != nil {
+				log.Printf("warning: ym drain updates: %v", err)
+			}
+			registerSelfMentionTrigger(me.Login)
+			log.Printf("[OK] Yandex Messenger bot: [%s] %s", me.ID, me.Login)
+			return nil
+		}
+	}
+
+	// The UI depends on no remote platform, so it starts before anything network-bound. Replay
+	// deliberately precedes it: a message recovered from a previous run must run before newly
+	// accepted traffic. Binding the socket still happens inside the source's own goroutine.
 	if d.sources["ui"] != nil && !disabled["ui"] {
 		d.startPoll("ui")
+	}
+
+	d.announceStartup(text)
+
+	for _, name := range []string{"tg", "mx", "vk", "ym"} {
+		if !disabled[name] {
+			d.connect(name)
+		}
 	}
 
 	// Block forever (goroutines do the work).
 	select {}
 }
 
+func startupNotice(marker *restartMarker) (kind, text string) {
+	if marker != nil && marker.Reason == "update" {
+		return "installed", fmt.Sprintf("✅ Установлен klax v%s", version)
+	}
+	return "started", fmt.Sprintf("✅ Запущен klax v%s", version)
+}
+
 // startPoll starts the inbound source loop for the given name.
 func (d *daemon) startPoll(name string) {
 	d.mu.Lock()
+	// A background handshake can succeed long after `/transports off` was issued — the retry runs for
+	// as long as the platform is down. Read the flag here, when the poll actually starts, so a
+	// disabled transport stays disabled. `/transports on` clears it before calling.
+	if d.disabled[name] {
+		d.mu.Unlock()
+		log.Printf("poll start skipped: %s is disabled", name)
+		return
+	}
 	// Stop existing loop if running.
 	if cancel, ok := d.pollCtx[name]; ok {
 		cancel()
@@ -610,33 +844,49 @@ func (d *daemon) stopPoll(name string) {
 
 // notifyAllUsers sends a message to all allowed users on enabled platforms.
 // These are self-initiated messages (no replyTo).
-func (d *daemon) notifyAllUsers(text string) {
-	if _, ok := d.transports["tg"]; ok && !d.disabled["tg"] {
+//
+// Runs concurrently with the poll loops, and /transports mutates the disabled set under d.mu, so
+// that set is snapshotted under the lock rather than read live.
+func (d *daemon) notifyAllUsers(text string) map[string]uint64 {
+	d.mu.Lock()
+	disabled := make(map[string]bool, len(d.disabled))
+	for k, v := range d.disabled {
+		disabled[k] = v
+	}
+	d.mu.Unlock()
+	if _, ok := d.transports["tg"]; ok && !disabled["tg"] {
 		for _, uid := range d.cfg.AllowedUsers {
 			chatID := fmt.Sprintf("tg:%d", uid)
 			log.Printf("notify %s", chatID)
 			d.sendMessage(chatID, "", text)
 		}
 	}
-	if _, ok := d.transports["mx"]; ok && !d.disabled["mx"] {
+	if _, ok := d.transports["mx"]; ok && !disabled["mx"] {
 		for _, uid := range d.cfg.MaxAllowedUsers {
 			chatID := fmt.Sprintf("mx:%d", uid)
 			log.Printf("notify %s", chatID)
 			d.sendMessage(chatID, "", text)
 		}
 	}
-	if _, ok := d.transports["vk"]; ok && !d.disabled["vk"] {
+	if _, ok := d.transports["vk"]; ok && !disabled["vk"] {
 		for _, uid := range d.cfg.VKAllowedUsers {
 			chatID := fmt.Sprintf("vk:%d", uid)
 			log.Printf("notify %s", chatID)
 			d.sendMessage(chatID, "", text)
 		}
 	}
-	d.uiNotifyAll(text)
+	if _, ok := d.transports["ym"]; ok && !disabled["ym"] {
+		for _, login := range d.cfg.YmAllowedUsers {
+			chatID := fmt.Sprintf("ym:%s", login)
+			log.Printf("notify %s", chatID)
+			d.sendMessage(chatID, "", text)
+		}
+	}
+	return d.uiNotifyAll(text)
 }
 
 // startDrain puts the daemon into draining mode.
-// Waits for current task AND queued tasks to finish before shutting down.
+// Waits for the current task AND queued tasks to finish before shutting down.
 func (d *daemon) startDrain(reason string) {
 	d.mu.Lock()
 	if d.draining {
@@ -650,7 +900,7 @@ func (d *daemon) startDrain(reason string) {
 	if readMarker() == nil {
 		writeMarker(reason)
 	}
-	d.notifyAllUsers("🔄 klax перезапускается...")
+	uiNotice := d.notifyAllUsers("🔄 Сервис перезапускается...")
 
 	// Kick processing on all session runners that have queued messages.
 	d.runnersMu.Lock()
@@ -664,10 +914,61 @@ func (d *daemon) startDrain(reason string) {
 	}
 	d.runnersMu.Unlock()
 
-	// Wait for all active session runners to finish.
+	// KLAX UPDATE INVARIANT — set the marker and WAIT FOREVER. We NEVER force a restart out from under
+	// a live run: an active session (notably a long-lived agent conversation running THROUGH this
+	// daemon — its turn IS the run we are draining) is waited on unconditionally, never cut mid-turn.
+	// The canonical `klax update` flow is: write the marker, report, and END THE TURN — the run then
+	// frees on its own and the drain completes, so systemd picks up the new binary. A bounded/forced
+	// restart would sever a turn "на ровном месте"; that is exactly the behaviour this invariant bans.
 	log.Println("waiting for all sessions to drain...")
-	d.drainWg.Wait()
-	d.shutdown()
+	// The wait is unbounded (invariant above), but NOT silent: while a run is still active, log a
+	// periodic heartbeat naming the busy chats so an operator watching `klax update` hang can see WHY
+	// and which session to `/abort` if one has genuinely wedged. This forces nothing — it only makes
+	// the wait diagnosable instead of a single line printed once at drain start.
+	done := make(chan struct{})
+	go func() { d.drainWg.Wait(); close(done) }()
+	waitStart := time.Now()
+	tick := time.NewTicker(30 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-done:
+			log.Println("all sessions drained")
+			if d.uiHub != nil {
+				d.uiHub.waitAcknowledged(uiNotice, 2*time.Second)
+			}
+			d.shutdown()
+			return
+		case <-tick.C:
+			busy := d.busyChats()
+			log.Printf("still draining after %s — %d session(s) active%s; /abort a wedged chat to unstick",
+				time.Since(waitStart).Round(time.Second), len(busy), formatBusyChats(busy))
+		}
+	}
+}
+
+// busyChats lists the chat ids with an active (running or queued) runner — used only for the drain
+// heartbeat log so an operator can see which session is holding up a restart.
+func (d *daemon) busyChats() []string {
+	d.runnersMu.Lock()
+	defer d.runnersMu.Unlock()
+	var out []string
+	for key, sr := range d.runners {
+		sr.mu.Lock()
+		active := sr.processing || len(sr.queue) > 0 || sr.runner.IsBusy()
+		sr.mu.Unlock()
+		if active {
+			out = append(out, key.sk)
+		}
+	}
+	return out
+}
+
+func formatBusyChats(chats []string) string {
+	if len(chats) == 0 {
+		return ""
+	}
+	return " [" + strings.Join(chats, ", ") + "]"
 }
 
 func (d *daemon) saveStore() {
@@ -715,10 +1016,60 @@ func (d *daemon) watchMarker() {
 			return
 		}
 		if m := readMarker(); m != nil {
+			// A UI-triggered install writes the marker before its goroutine records and broadcasts
+			// the result. Let that ONE owner finish first; the next tick starts the normal drain.
+			if d.systemUpdateRunning() {
+				continue
+			}
 			log.Printf("restart marker found (reason: %s)", m.Reason)
 			d.startDrain(m.Reason)
 			return
 		}
+	}
+}
+
+// dispatchInbound applies the allowed-user / group-trigger gating shared by
+// every messenger poll loop (tg/mx/vk/ym): an allowed user's DM is queued
+// directly; in a group chat, group commands, trigger prefixes, and the
+// configured attachment mode apply;
+// anything else (a non-allowed DM, or a group message with no prefix/command)
+// is dropped silently. attachErrs (download failures noted by the caller) are
+// reported only once the message is actually going to be accepted, mirroring
+// each platform's previous inline behaviour.
+func (d *daemon) dispatchInbound(chatID, msgID, text string, attachments []attachment, attachErrs []string, allowed bool, origin inbound.Origin) {
+	notifyAttachErrs := func() {
+		if len(attachErrs) > 0 {
+			d.sendPlain(chatID, msgID, "Не удалось скачать:\n• "+strings.Join(attachErrs, "\n• "))
+		}
+	}
+	if !d.isGroupChat(chatID) {
+		if !allowed {
+			return
+		}
+		notifyAttachErrs()
+		d.handleInbound(Inbound{ChatID: chatID, MsgID: msgID, Text: text, Attachments: attachments, Origin: origin})
+		return
+	}
+	if strings.HasPrefix(text, "/") && (allowed || isGroupCommand(text)) {
+		notifyAttachErrs()
+		d.ensureSessionWithCWD(d.sessionKey(chatID), d.sessionCWD(chatID))
+		d.handleCommand(chatID, msgID, text)
+		return
+	}
+	hadAttachment := len(attachments) > 0 || len(attachErrs) > 0
+	if blocked, addressed := d.groupAttachmentsBlocked(chatID, text, hadAttachment); blocked {
+		if addressed {
+			d.sendPlain(chatID, msgID, "📎 Вложения выключены: /attachments on")
+		}
+		return
+	}
+	if prompt, ok := d.groupPrompt(chatID, text, hadAttachment); ok {
+		notifyAttachErrs()
+		if prompt == "" && len(attachments) == 0 {
+			return
+		}
+		d.ensureSessionWithCWD(d.sessionKey(chatID), d.sessionCWD(chatID))
+		d.enqueueToSessionOrigin(chatID, msgID, prompt, text, attachments, 0, "", origin, nil)
 	}
 }
 
@@ -810,26 +1161,12 @@ func (d *daemon) pollTG(ctx context.Context) {
 				}
 			}
 
-			notifyAttachErrs := func() {
-				if len(attachErrs) > 0 {
-					d.sendPlain(chatID, msgID, "Не удалось скачать:\n• "+strings.Join(attachErrs, "\n• "))
-				}
-			}
-
-			if d.isTGAllowed(msg.From.ID) {
-				notifyAttachErrs()
-				d.handleMessageWithAttachments(chatID, msgID, text, attachments)
-			} else if d.isGroupChat(chatID) {
-				if strings.HasPrefix(text, "/") && isGroupCommand(text) {
-					notifyAttachErrs()
-					d.ensureSessionWithCWD(d.sessionKey(chatID), d.sessionCWD(chatID))
-					d.handleCommand(chatID, msgID, text)
-				} else if prompt, ok := stripGroupTrigger(strings.TrimSpace(text)); ok {
-					notifyAttachErrs()
-					d.ensureSessionWithCWD(d.sessionKey(chatID), d.sessionCWD(chatID))
-					d.enqueueWithAttachments(chatID, msgID, prompt, attachments)
-				}
-			}
+			d.dispatchInbound(chatID, msgID, text, attachments, attachErrs, d.isTGAllowed(msg.From.ID), inbound.Origin{
+				Transport: "tg",
+				Chat:      inbound.Chat{ID: strconv.FormatInt(msg.Chat.ID, 10), Type: msg.Chat.Type, Title: msg.Chat.Title},
+				Message:   inbound.Message{ID: msgID, SentAt: turnaudit.UnixSeconds(int64(msg.Date))},
+				Sender:    inbound.Sender{ID: strconv.FormatInt(msg.From.ID, 10), Username: msg.From.Username, DisplayName: strings.TrimSpace(msg.From.FirstName + " " + msg.From.LastName)},
+			})
 		}
 	}
 }
@@ -896,26 +1233,12 @@ func (d *daemon) pollMAX(ctx context.Context) {
 				continue
 			}
 
-			notifyAttachErrs := func() {
-				if len(attachErrs) > 0 {
-					d.sendPlain(chatID, msgID, "Не удалось скачать:\n• "+strings.Join(attachErrs, "\n• "))
-				}
-			}
-
-			if d.isMAXAllowed(senderID) {
-				notifyAttachErrs()
-				d.handleMessageWithAttachments(chatID, msgID, text, attachments)
-			} else if d.isGroupChat(chatID) {
-				if strings.HasPrefix(text, "/") && isGroupCommand(text) {
-					notifyAttachErrs()
-					d.ensureSessionWithCWD(d.sessionKey(chatID), d.sessionCWD(chatID))
-					d.handleCommand(chatID, msgID, text)
-				} else if prompt, ok := stripGroupTrigger(strings.TrimSpace(text)); ok {
-					notifyAttachErrs()
-					d.ensureSessionWithCWD(d.sessionKey(chatID), d.sessionCWD(chatID))
-					d.enqueueWithAttachments(chatID, msgID, prompt, attachments)
-				}
-			}
+			d.dispatchInbound(chatID, msgID, text, attachments, attachErrs, d.isMAXAllowed(senderID), inbound.Origin{
+				Transport: "mx",
+				Chat:      inbound.Chat{ID: strings.TrimPrefix(chatID, "mx:"), Type: upd.Message.Recipient.ChatType},
+				Message:   inbound.Message{ID: msgID, SentAt: turnaudit.UnixMillis(upd.Message.Timestamp)},
+				Sender:    inbound.Sender{ID: strconv.FormatInt(senderID, 10), Username: upd.Message.Sender.Username, DisplayName: upd.Message.Sender.Name},
+			})
 		}
 	}
 }
@@ -968,14 +1291,12 @@ func (d *daemon) pollVK(ctx context.Context) {
 				continue
 			}
 			msgID := strconv.Itoa(msg.ID)
-			if d.isVKAllowed(msg.FromID) {
-				d.handleMessage(chatID, msgID, msg.Text)
-			} else if d.isGroupChat(chatID) {
-				if prompt, ok := stripGroupTrigger(strings.TrimSpace(msg.Text)); ok {
-					d.ensureSessionWithCWD(d.sessionKey(chatID), d.sessionCWD(chatID))
-					d.enqueue(chatID, msgID, prompt)
-				}
-			}
+			d.dispatchInbound(chatID, msgID, msg.Text, nil, nil, d.isVKAllowed(msg.FromID), inbound.Origin{
+				Transport: "vk",
+				Chat:      inbound.Chat{ID: strconv.Itoa(msg.PeerID)},
+				Message:   inbound.Message{ID: msgID},
+				Sender:    inbound.Sender{ID: strconv.Itoa(msg.FromID)},
+			})
 		}
 	}
 }
@@ -998,16 +1319,213 @@ func (d *daemon) isMAXAllowed(id int64) bool {
 	return false
 }
 
+// ymThreadChatID returns the per-thread chatID for a ym group/channel
+// message: parentChatID ("ym:<chat_id>") with the thread id encoded onto it
+// via ym.EncodeThreadChatID (escaped, not just concatenated — see there for
+// why). A thread continues its parent group rather than starting a fresh
+// space — its own session list and own /groups on|off from the moment it's
+// first seen, but seeded from the parent: the SAME working directory (not a
+// new groups/<...> sibling) and the parent's current scope defaults (backend,
+// model, thinking, sandbox, tty — the exact set Store.New/Ensure already uses
+// to seed any brand-new session, just sourced from the parent chat here
+// instead of the built-in fallback). This happens once, right here, the
+// first time this thread's chatID is encountered; after that the two evolve
+// completely independently, same as any other two distinct group chats.
+// sendMsg/EditMessage parse the encoded suffix back out (see ym.splitThread)
+// so replies stay inside the thread instead of leaking to the parent's main
+// channel.
+//
+// "First time" means neither a session nor a GroupMode marker exists. The
+// marker survives session removal, while the session check preserves the
+// already-independent state of threads created before the marker existed.
+func (d *daemon) ymThreadChatID(parentChatID string, threadID int64) string {
+	chatID := ym.EncodeThreadChatID(parentChatID, threadID)
+	sk := d.sessionKey(chatID)
+	threadDefaults := d.store.ScopeDefaults(sk)
+	firstSeen := (threadDefaults == nil || threadDefaults.GroupMode == nil) && d.store.Active(sk) == nil
+	if firstSeen && d.isGroupChat(parentChatID) {
+		// The parent's ScopeDefaults.CWD is the live truth (kept in sync by
+		// /cwd, same as Backend/Model/Think/Sandbox), not the groupChats
+		// registry: that registry is only seeded once at /groups on time and
+		// never updated afterwards, so after a /cwd override it still holds
+		// the group's original auto-assigned directory. Using it here would
+		// silently resurrect that stale default instead of continuing the
+		// group's actual, current workspace.
+		parentDefaults := d.store.EnsureScopeDefaults(parentChatID, d.fallbackScopeDefaults())
+		cwd := parentDefaults.CWD
+		if cwd == "" {
+			cwd = d.groupCWD(parentChatID)
+		}
+		if cwd == "" {
+			cwd = d.sessionCWD(chatID) // defensive fallback; isGroupChat(parentChatID) implies one of the above is normally set
+		}
+		attachmentMode := d.groupAttachmentMode(parentChatID)
+		d.store.UpdateScopeDefaults(sk, func(def *session.ScopeDefaults) {
+			*def = *parentDefaults
+			def.CWD = cwd
+			enabled := true
+			verbose := d.chatVerboseEnabled(parentChatID)
+			def.GroupMode = &enabled
+			def.GroupVerbose = &verbose
+			def.GroupAttachmentMode = attachmentMode
+			def.LegacyGroupAttachments = nil
+		})
+		d.saveStore()
+	}
+	return chatID
+}
+
+func (d *daemon) pollYM(ctx context.Context) {
+	bot := d.transports["ym"].(*ym.Bot)
+	for {
+		if !d.waitOutboundReady(ctx, "ym") {
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		updates, err := bot.GetUpdates()
+		if err != nil {
+			log.Printf("ym: getUpdates error: %v (retry in 5s)", err)
+			if !sleepCtx(ctx, 5*time.Second) {
+				return
+			}
+			continue
+		}
+		if len(updates) == 0 {
+			// getUpdates has no server-side long-poll wait, unlike tg/mx/vk
+			// (see YM_API_NOTES.md) — pace client-side so an empty result
+			// doesn't hammer the API.
+			if !sleepCtx(ctx, 2*time.Second) {
+				return
+			}
+			continue
+		}
+		for _, upd := range updates {
+			// chat.type is the authoritative signal, NOT whether chat.id is
+			// empty: contrary to the documented shape, a private update's
+			// chat.id is NOT empty in practice — it's a composite per-dialog
+			// id ("<bot_id>_<user_id>"), neither a login nor a routable
+			// chat_id. Addressing a private chat must use the sender's login
+			// (see ym.IsLogin/IsGroup, and YM_API_NOTES.md).
+			var addr string
+			if upd.Chat.Type == "private" {
+				addr = upd.From.Login
+			} else {
+				addr = upd.Chat.ID
+			}
+			if addr == "" {
+				continue
+			}
+			chatID := fmt.Sprintf("ym:%s", addr)
+			// A thread is its own independent group (own CWD, own session
+			// list, own /groups on|off) — it just inherits the parent
+			// group's on|off state once, the first time the thread is seen.
+			if upd.Chat.ThreadID != 0 && upd.Chat.Type != "private" {
+				chatID = d.ymThreadChatID(chatID, upd.Chat.ThreadID)
+			}
+			d.bumpChatActivity(chatID)
+			// /id — respond to anyone, even unauthenticated
+			if strings.TrimSpace(upd.Text) == "/id" {
+				reply := fmt.Sprintf("login: %s\nid: %s", upd.From.Login, upd.From.ID)
+				if upd.Chat.Type != "private" {
+					reply += fmt.Sprintf("\nchat_id: %s", upd.Chat.ID)
+				}
+				if upd.Chat.ThreadID != 0 {
+					reply += fmt.Sprintf("\nthread_id: %d", upd.Chat.ThreadID)
+				}
+				d.sendPlain(chatID, "", reply)
+				continue
+			}
+			msgID := strconv.FormatInt(upd.MessageID, 10)
+			text := upd.Text
+
+			// Download attachments: images (best size variant per group) and
+			// generic files. Yandex Messenger has no separate voice/audio type
+			// (see YM_API_NOTES.md) — any non-image attachment arrives as File.
+			var attachments []attachment
+			var attachErrs []string
+			for _, group := range upd.Images {
+				img := ym.BestImage(group)
+				if img == nil {
+					continue
+				}
+				data, err := bot.DownloadFile(img.FileID)
+				if err != nil {
+					log.Printf("ym: download image: %v", err)
+					attachErrs = append(attachErrs, fmt.Sprintf("изображение: %v", err))
+					continue
+				}
+				name := img.Name
+				if name == "" {
+					name = "image.jpg"
+				}
+				attachments = append(attachments, attachment{filename: name, data: data})
+			}
+			if upd.File != nil {
+				data, err := bot.DownloadFile(upd.File.ID)
+				if err != nil {
+					log.Printf("ym: download file: %v", err)
+					label := "файл"
+					if upd.File.Name != "" {
+						label = fmt.Sprintf("файл %q", upd.File.Name)
+					}
+					attachErrs = append(attachErrs, fmt.Sprintf("%s: %v", label, err))
+				} else {
+					name := upd.File.Name
+					if name == "" {
+						name = "file"
+					}
+					attachments = append(attachments, attachment{filename: name, data: data})
+				}
+			}
+
+			if text == "" && len(attachments) == 0 && len(attachErrs) == 0 {
+				continue
+			}
+
+			d.dispatchInbound(chatID, msgID, text, attachments, attachErrs, d.isYMAllowed(upd.From.Login), inbound.Origin{
+				Transport: "ym",
+				Chat:      inbound.Chat{ID: addr, Type: upd.Chat.Type, ThreadID: turnaudit.UnixID(upd.Chat.ThreadID)},
+				Message:   inbound.Message{ID: msgID, SentAt: turnaudit.UnixSeconds(upd.Timestamp)},
+				Sender:    inbound.Sender{ID: upd.From.ID, Username: upd.From.Login, DisplayName: upd.From.DisplayName},
+			})
+		}
+	}
+}
+
+func (d *daemon) isYMAllowed(login string) bool {
+	if login == "" {
+		return false
+	}
+	login = strings.ToLower(login)
+	for _, l := range d.cfg.YmAllowedUsers {
+		if strings.ToLower(l) == login {
+			return true
+		}
+	}
+	return false
+}
+
 // isGroupChat returns true if the chat has group mode enabled.
 func (d *daemon) isGroupChat(chatID string) bool {
+	if isYMThreadChatID(chatID) {
+		def := d.store.ScopeDefaults(d.sessionKey(chatID))
+		return def != nil && def.GroupMode != nil && *def.GroupMode
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	_, ok := d.groupChats[chatID]
 	return ok
 }
 
+func isYMThreadChatID(chatID string) bool {
+	return strings.HasPrefix(chatID, "ym:") && ym.IsThread(strings.TrimPrefix(chatID, "ym:"))
+}
+
 // isGroupChatID returns true if the chatID refers to a group (not a DM).
 // TG: negative chat ID. MAX: negative chat ID. VK: peer_id >= 2000000000.
+// ym: chat_id ("0/0/<guid>") vs. login ("user@domain") — see ym.IsGroup.
 func isGroupChatID(chatID string) bool {
 	idx := strings.Index(chatID, ":")
 	if idx == -1 {
@@ -1015,20 +1533,44 @@ func isGroupChatID(chatID string) bool {
 	}
 	prefix := chatID[:idx]
 	raw := chatID[idx+1:]
-	if prefix == "vk" {
+	switch prefix {
+	case "vk":
 		if id, err := strconv.Atoi(raw); err == nil {
 			return id >= 2000000000
 		}
 		return false
+	case "ym":
+		return ym.IsGroup(raw)
+	default:
+		return len(raw) > 0 && raw[0] == '-'
 	}
-	return len(raw) > 0 && raw[0] == '-'
 }
 
 // groupCWD returns the CWD for a group chat, or "" if not a group.
 func (d *daemon) groupCWD(chatID string) string {
+	if isYMThreadChatID(chatID) {
+		if def := d.store.ScopeDefaults(d.sessionKey(chatID)); def != nil && def.GroupMode != nil && *def.GroupMode {
+			return def.CWD
+		}
+		return ""
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.groupChats[chatID]
+}
+
+var reUnsafeDirChar = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
+
+// sanitizeDirName turns an arbitrary chatID into a safe, single flat
+// filesystem directory-name component: every character outside
+// [a-zA-Z0-9_-] becomes "_". A whitelist, not a blacklist of specific chars
+// (":", "/", "..", ...) — some transport's chat ids aren't just
+// colon-separated (ym's group/channel chat_id looks like "0/0/<guid>"), and a
+// blacklist would need to keep chasing every new transport's id shape.
+// Without this, filepath.Join treats an embedded "/" as a real path
+// separator and silently creates nested directories instead of one.
+func sanitizeDirName(s string) string {
+	return reUnsafeDirChar.ReplaceAllString(s, "_")
 }
 
 // sessionCWD returns the effective working directory for a chat session.
@@ -1043,7 +1585,7 @@ func (d *daemon) sessionCWD(chatID string) string {
 		if base == "" {
 			base, _ = os.UserHomeDir()
 		}
-		dirName := strings.ReplaceAll(chatID, ":", "_")
+		dirName := sanitizeDirName(chatID)
 		cwd := filepath.Join(base, "groups", dirName)
 		if err := os.MkdirAll(cwd, 0755); err != nil {
 			log.Printf("group cwd mkdir failed for %s: %v", chatID, err)
@@ -1054,8 +1596,47 @@ func (d *daemon) sessionCWD(chatID string) string {
 	return ""
 }
 
+func (d *daemon) userDefaultCWD(sk string) string {
+	if d.cfg == nil {
+		return ""
+	}
+	const prefix = "user:"
+	if !strings.HasPrefix(sk, prefix) {
+		return ""
+	}
+	id := strings.TrimPrefix(sk, prefix)
+	for _, u := range d.cfg.Users {
+		if u.ID == id {
+			cwd := strings.TrimSpace(u.CWD)
+			if cwd == "" {
+				return ""
+			}
+			resolved, err := resolveWorkingDir(cwd)
+			if err != nil {
+				log.Printf("user cwd ignored for %s: %v", sk, err)
+				return ""
+			}
+			return resolved
+		}
+	}
+	return ""
+}
+
 // enableGroupChat enables group mode for a chat with the given CWD.
 func (d *daemon) enableGroupChat(chatID, cwd string) {
+	if isYMThreadChatID(chatID) {
+		d.store.UpdateScopeDefaults(d.sessionKey(chatID), func(def *session.ScopeDefaults) {
+			enabled := true
+			def.GroupMode = &enabled
+			def.CWD = cwd
+			if def.GroupVerbose == nil {
+				verbose := true
+				def.GroupVerbose = &verbose
+			}
+		})
+		d.saveStore()
+		return
+	}
 	d.mu.Lock()
 	if d.groupVerb == nil {
 		d.groupVerb = make(map[string]bool)
@@ -1069,6 +1650,13 @@ func (d *daemon) enableGroupChat(chatID, cwd string) {
 }
 
 func (d *daemon) setGroupVerbose(chatID string, enabled bool) {
+	if isYMThreadChatID(chatID) {
+		d.store.UpdateScopeDefaults(d.sessionKey(chatID), func(def *session.ScopeDefaults) {
+			def.GroupVerbose = &enabled
+		})
+		d.saveStore()
+		return
+	}
 	d.mu.Lock()
 	if d.groupVerb == nil {
 		d.groupVerb = make(map[string]bool)
@@ -1078,8 +1666,40 @@ func (d *daemon) setGroupVerbose(chatID string, enabled bool) {
 	d.saveGroupChats()
 }
 
+func (d *daemon) setGroupAttachmentMode(chatID, mode string) {
+	d.store.UpdateScopeDefaults(d.sessionKey(chatID), func(def *session.ScopeDefaults) {
+		def.GroupAttachmentMode = mode
+		def.LegacyGroupAttachments = nil
+	})
+	d.saveStore()
+}
+
+func (d *daemon) groupAttachmentMode(chatID string) string {
+	if !isGroupChatID(chatID) {
+		return "on"
+	}
+	def := d.store.ScopeDefaults(d.sessionKey(chatID))
+	if def == nil {
+		return "on"
+	}
+	switch def.GroupAttachmentMode {
+	case "off", "on", "any":
+		return def.GroupAttachmentMode
+	}
+	if def.LegacyGroupAttachments != nil && *def.LegacyGroupAttachments {
+		return "any"
+	}
+	return "on"
+}
+
 func (d *daemon) chatVerboseEnabled(chatID string) bool {
 	if !isGroupChatID(chatID) {
+		return true
+	}
+	if isYMThreadChatID(chatID) {
+		if def := d.store.ScopeDefaults(d.sessionKey(chatID)); def != nil && def.GroupVerbose != nil {
+			return *def.GroupVerbose
+		}
 		return true
 	}
 	d.mu.Lock()
@@ -1092,6 +1712,14 @@ func (d *daemon) chatVerboseEnabled(chatID string) bool {
 
 // disableGroupChat disables group mode for a chat.
 func (d *daemon) disableGroupChat(chatID string) {
+	if isYMThreadChatID(chatID) {
+		d.store.UpdateScopeDefaults(d.sessionKey(chatID), func(def *session.ScopeDefaults) {
+			enabled := false
+			def.GroupMode = &enabled
+		})
+		d.saveStore()
+		return
+	}
 	d.mu.Lock()
 	delete(d.groupChats, chatID)
 	delete(d.groupVerb, chatID)
@@ -1127,16 +1755,49 @@ func (d *daemon) saveGroupChats() {
 
 // groupTriggerPrefixes are the recognized prefixes for group mode messages.
 // Checked case-insensitively. Must be followed by comma or any whitespace.
-var groupTriggerPrefixes = []string{
-	"klax", "клакс", "клэкс", "клац",
-	"kl", "кл",
+// Copy-on-write behind an atomic: registrations happen on background connect goroutines while
+// other transports are already reading the list.
+var groupTriggerPrefixes atomic.Value // []string
+
+var groupTriggerMu sync.Mutex // serializes the read-copy-append-store of groupTriggerPrefixes
+
+func init() {
+	groupTriggerPrefixes.Store([]string{
+		"klax", "клакс", "клэкс", "клац",
+		"kl", "кл",
+	})
+}
+
+func triggerPrefixes() []string { return groupTriggerPrefixes.Load().([]string) }
+
+// registerSelfMentionTrigger adds "@<login>" as one more recognized group trigger,
+// alongside "клакс"/"kl"/..., once the bot's own username/login on a transport is known
+// (GetMe at startup) — called for both Telegram (Username) and Yandex Messenger (Login).
+// An @mention insert has no separate structured-entity handling here: inspecting a real
+// raw YM update showed it already renders as plain "@<bot login> " text (in addition to
+// a structured mentioned_users field, deliberately ignored), and Telegram's entities are
+// likewise offsets into a text that already contains the literal "@username" — the bot's
+// own username is never used by anyone else, so this alone makes an @mention behave
+// exactly like typing the trigger word, with no new parsing path to keep in sync with
+// stripGroupTrigger.
+func registerSelfMentionTrigger(login string) {
+	login = strings.ToLower(strings.TrimSpace(login))
+	if login == "" {
+		return
+	}
+	groupTriggerMu.Lock()
+	defer groupTriggerMu.Unlock()
+	cur := triggerPrefixes()
+	next := make([]string, len(cur), len(cur)+1)
+	copy(next, cur)
+	groupTriggerPrefixes.Store(append(next, "@"+login))
 }
 
 // stripGroupTrigger checks if text starts with a group trigger prefix.
 // Returns the remaining text (trimmed) and true, or "" and false.
 func stripGroupTrigger(text string) (string, bool) {
 	lower := strings.ToLower(text)
-	for _, prefix := range groupTriggerPrefixes {
+	for _, prefix := range triggerPrefixes() {
 		if !strings.HasPrefix(lower, prefix) {
 			continue
 		}
@@ -1156,6 +1817,28 @@ func stripGroupTrigger(text string) (string, bool) {
 		return rest, true
 	}
 	return "", false
+}
+
+// groupPrompt is the single group-trigger policy. An explicit trigger always
+// wins; with /attachments any, carrying a file supplies it implicitly.
+func (d *daemon) groupPrompt(chatID, text string, hasAttachment bool) (string, bool) {
+	if prompt, ok := stripGroupTrigger(strings.TrimSpace(text)); ok {
+		return prompt, true
+	}
+	if hasAttachment && d.groupAttachmentMode(chatID) == "any" {
+		return strings.TrimSpace(text), true
+	}
+	return "", false
+}
+
+// groupAttachmentsBlocked is the single off-mode policy. Ambient group files
+// are ignored silently; an explicitly addressed file can receive a rejection.
+func (d *daemon) groupAttachmentsBlocked(chatID, text string, hasAttachment bool) (blocked, addressed bool) {
+	if !hasAttachment || d.groupAttachmentMode(chatID) != "off" {
+		return false, false
+	}
+	_, addressed = stripGroupTrigger(strings.TrimSpace(text))
+	return true, addressed
 }
 
 // isGroupCommand checks if text starts with a command allowed for non-admin group members.
@@ -1183,17 +1866,13 @@ func isGroupCommand(text string) bool {
 	return false
 }
 
-func (d *daemon) handleMessage(chatID, msgID, text string) {
-	d.handleMessageWithAttachments(chatID, msgID, text, nil)
-}
-
 func (d *daemon) handleMessageWithAttachments(chatID, msgID, text string, attachments []attachment) {
 	d.handleInbound(Inbound{ChatID: chatID, MsgID: msgID, Text: text, Attachments: attachments})
 }
 
 // handleInbound is the unified intake for every source. It trims, ensures a
 // session, then routes: a "/"-command goes to handleCommand; in group mode the
-// trigger prefix is required; otherwise the message is queued. TargetCreated is
+// trigger/attachment policy is applied; otherwise the message is queued. TargetCreated is
 // threaded to the enqueue so a UI tab can address a specific session (0 = the
 // active one, which every messenger uses).
 // handleInbound routes one inbound message; it returns whether an actual message
@@ -1221,17 +1900,20 @@ func (d *daemon) handleInbound(in Inbound) bool {
 		return true
 	}
 
-	// In group mode, require trigger prefix for all users
+	// In group mode, require a trigger prefix unless attachments supply it.
 	if d.isGroupChat(in.ChatID) {
-		if prompt, ok := stripGroupTrigger(text); ok {
-			return d.enqueueToSession(in.ChatID, in.MsgID, prompt, in.Attachments, in.TargetCreated, in.Nonce)
+		if blocked, _ := d.groupAttachmentsBlocked(in.ChatID, text, len(in.Attachments) > 0); blocked {
+			return false
+		}
+		if prompt, ok := d.groupPrompt(in.ChatID, text, len(in.Attachments) > 0); ok {
+			return d.enqueueToSessionOrigin(in.ChatID, in.MsgID, prompt, in.Text, in.Attachments, in.TargetCreated, in.Nonce, in.Origin, in.admission)
 		}
 		// No prefix — ignore silently
 		return false
 	}
 
 	// Queue for Claude
-	return d.enqueueToSession(in.ChatID, in.MsgID, text, in.Attachments, in.TargetCreated, in.Nonce)
+	return d.enqueueToSessionOrigin(in.ChatID, in.MsgID, text, in.Text, in.Attachments, in.TargetCreated, in.Nonce, in.Origin, in.admission)
 }
 
 func (d *daemon) ensureSession(sessionKey string) {
@@ -1239,12 +1921,16 @@ func (d *daemon) ensureSession(sessionKey string) {
 }
 
 func (d *daemon) ensureSessionWithCWD(sessionKey, forceCWD string) {
-	if sess := d.store.Active(sessionKey); sess != nil {
-		if forceCWD == "" || sess.CWD == forceCWD {
-			return
-		}
+	if d.store.Active(sessionKey) != nil {
+		return
 	}
-	cwd := forceCWD
+	cwd := d.scopeDefaults(sessionKey).CWD
+	if cwd == "" {
+		cwd = forceCWD
+	}
+	if cwd == "" {
+		cwd = d.userDefaultCWD(sessionKey)
+	}
 	if cwd == "" {
 		cwd = d.cfg.DefaultCWD
 	}

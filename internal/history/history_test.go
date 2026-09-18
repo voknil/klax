@@ -1,11 +1,45 @@
 package history
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestTurnAuditSnapshotUsesBoundRecordAndExactBytes(t *testing.T) {
+	lines := []string{
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"previous"}]}}`,
+		`{"type":"user","message":{"content":"current"}}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"answer"}],"usage":{"input_tokens":7,"cache_read_input_tokens":3}}}`,
+	}
+	data := strings.Join(lines, "\r\n") + "\r\n"
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, err := readAuditSessionFile("claude", "session", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := session.Turn(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBytes := []byte(strings.Join(lines[1:], "\r\n") + "\r\n")
+	sum := sha256.Sum256(wantBytes)
+	if snap.FromEvent != 1 || snap.ToEvent != 3 || snap.SHA256 != hex.EncodeToString(sum[:]) {
+		t.Fatalf("raw snapshot = %+v", snap)
+	}
+	if len(snap.Blocks) != 2 || snap.Blocks[0].Role != "user" || snap.Blocks[0].Text != "current" || snap.Blocks[1].Text != "answer" {
+		t.Fatalf("blocks = %+v", snap.Blocks)
+	}
+	if snap.ContextUsed != 10 {
+		t.Fatalf("context used = %d, want 10", snap.ContextUsed)
+	}
+}
 
 func writeLines(t *testing.T, lines []string) string {
 	t.Helper()
@@ -50,7 +84,106 @@ func TestReadClaude(t *testing.T) {
 	if items[2].Role != "assistant" || items[2].Text != "done" {
 		t.Fatalf("item2 = %+v", items[2])
 	}
-	if items[3].Role != "system" || items[3].Kind != "compact" {
+	if items[3].Role != "tool" || !strings.Contains(items[3].Text, "🗜 Compaction: 100→10 tokens · auto") {
+		t.Fatalf("item3 = %+v", items[3])
+	}
+}
+
+func TestLatestContextUsesLastAssistantUsage(t *testing.T) {
+	// The one canonical context source: the transcript's LAST assistant message that
+	// reported usage (input+cache_read+cache_creation). Earlier messages must not win.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cwd := "/tmp/proj"
+	dir := filepath.Join(home, ".claude", "projects", encodeProjectDir(cwd))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := `{"type":"assistant","message":{"content":[{"type":"text","text":"a1"}],"usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":5}}}` + "\n" +
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"a2"}],"usage":{"input_tokens":20,"cache_read_input_tokens":180,"cache_creation_input_tokens":8}}}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "sess-1.jsonl"), []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	used, window := LatestContext("claude", "sess-1", cwd)
+	if used != 208 || window != 0 { // 20+180+8; Claude transcript carries no window
+		t.Fatalf("LatestContext = %d/%d, want 208/0", used, window)
+	}
+}
+
+func TestReadClaudeNormalizesToolsLikeLive(t *testing.T) {
+	// Reload must canonicalize Claude tools identically to the live stream (one
+	// NormalizeClaudeToolUse): Bash→Exec, TodoWrite→Plan with the plan-progress preview.
+	path := writeLines(t, []string{
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls /tmp"}}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TodoWrite","input":{"todos":[{"content":"first","status":"completed","activeForm":"Firsting"},{"content":"second","status":"in_progress","activeForm":"Doing second"}]}}]}}`,
+	})
+	items, err := readClaude(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("want 2 items, got %d: %+v", len(items), items)
+	}
+	if tc := items[0].Tools[0]; tc.Name != "Exec" || !strings.Contains(tc.Label, "⚙️ Exec") {
+		t.Fatalf("Bash not normalized to Exec: %+v", tc)
+	}
+	if tc := items[1].Tools[0]; tc.Name != "Plan" || !strings.Contains(tc.Label, "Doing second") || !strings.Contains(tc.Label, "1/2") {
+		t.Fatalf("TodoWrite not normalized to Plan on reload: %+v", tc)
+	}
+}
+
+func TestReadClaudeSkipsMetaRows(t *testing.T) {
+	// The SDK writes the image-view annotation as a role=user row flagged isMeta:true.
+	// It is internal, not human input, and must never render as a user message.
+	path := writeLines(t, []string{
+		`{"type":"user","message":{"content":"real message"},"timestamp":"2026-07-10T10:00:00Z"}`,
+		`{"type":"user","isMeta":true,"message":{"role":"user","content":"[Image: original 2150x1204, displayed at 2000x1120. Multiply coordinates by 1.07 to map to original image.]"}}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}`,
+	})
+	items, err := readClaude(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("want 2 items (meta row dropped), got %d: %+v", len(items), items)
+	}
+	for _, it := range items {
+		if strings.Contains(it.Text, "Multiply coordinates") {
+			t.Fatalf("meta image annotation leaked as a message: %+v", it)
+		}
+	}
+	if items[0].Role != "user" || items[0].Text != "real message" {
+		t.Fatalf("item0 = %+v", items[0])
+	}
+}
+
+func TestReadClaudeRendersCompactContinuationAsTool(t *testing.T) {
+	path := writeLines(t, []string{
+		`{"type":"user","message":{"content":"before <!-- klax-turn:1111111111111111 -->"}}`,
+		`{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"manual","preTokens":200000,"postTokens":8000}}`,
+		`{"type":"user","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\nEarlier context."}}`,
+		`{"type":"user","message":{"role":"user","content":"<local-command-caveat>Caveat: The messages below were generated by the user while running local commands. DO NOT respond to these messages or otherwise consider them in your response unless the user explicitly asks you to.</local-command-caveat>"}}`,
+		`{"type":"user","message":{"role":"user","content":"<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>"}}`,
+		`{"type":"user","message":{"role":"user","content":"<local-command-stdout>\u001b[2mCompacted (ctrl+o to see full summary)\u001b[22m</local-command-stdout>"}}`,
+		`{"type":"user","message":{"content":"after <!-- klax-turn:2222222222222222 -->"}}`,
+	})
+	items, err := readClaude(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 4 {
+		t.Fatalf("want 4 items, got %d: %+v", len(items), items)
+	}
+	if items[0].Role != "user" || items[0].Text != "before" || items[0].Marker != "1111111111111111" {
+		t.Fatalf("item0 = %+v", items[0])
+	}
+	if items[1].Role != "tool" || !strings.Contains(items[1].Text, "🗜 Compaction: 200k→8k tokens · manual") {
+		t.Fatalf("item1 = %+v", items[1])
+	}
+	if items[2].Role != "tool" || !strings.HasPrefix(items[2].Text, "🗜 Compaction: ") || !strings.Contains(items[2].Text, "Earlier context.") {
+		t.Fatalf("item2 = %+v", items[2])
+	}
+	if items[3].Role != "user" || items[3].Text != "after" || items[3].Marker != "2222222222222222" {
 		t.Fatalf("item3 = %+v", items[3])
 	}
 }
@@ -62,7 +195,7 @@ func TestReadCodex(t *testing.T) {
 		`{"type":"response_item","payload":{"type":"reasoning","summary":[]}}`, // internal, ignored
 		`{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hello\",\"yield_time_ms\":1000}"}}`,
 		`{"type":"event_msg","payload":{"type":"agent_message","message":"doing X"}}`,
-		`{"type":"event_msg","payload":{"type":"token_count","info":{}}}`, // meta, ignored
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":144000},"model_context_window":258400}}}`,
 	})
 	items, err := readCodex(path)
 	if err != nil {
@@ -74,14 +207,113 @@ func TestReadCodex(t *testing.T) {
 	if items[0].Role != "user" || items[0].Text != "do X" {
 		t.Fatalf("item0 = %+v", items[0])
 	}
-	if items[1].Role != "assistant" || len(items[1].Tools) != 1 || items[1].Tools[0].Name != "Bash" {
+	if items[1].Role != "assistant" || len(items[1].Tools) != 1 || items[1].Tools[0].Name != "Exec" {
 		t.Fatalf("item1 = %+v", items[1])
 	}
-	if tc := items[1].Tools[0]; !strings.Contains(tc.Label, "Bash") || !strings.Contains(tc.Label, "echo hello") {
+	if tc := items[1].Tools[0]; !strings.Contains(tc.Label, "Exec") || !strings.Contains(tc.Label, "echo hello") {
 		t.Fatalf("codex tool label not enriched: %+v", tc)
 	}
 	if items[2].Role != "assistant" || items[2].Text != "doing X" {
 		t.Fatalf("item2 = %+v", items[2])
+	}
+	if items[2].CtxUsed != 144000 || items[2].CtxWindow != 258400 {
+		t.Fatalf("item2 context = %d/%d, want 144000/258400", items[2].CtxUsed, items[2].CtxWindow)
+	}
+}
+
+func TestReadCodexCompletedItems(t *testing.T) {
+	path := writeLines(t, []string{
+		`{"type":"session_meta","payload":{"id":"x"}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<recommended_plugins>injected</recommended_plugins>"}]}}`,
+		`{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"u1","content":[{"type":"text","text":"do X <!-- klax-turn:4444444444444444 -->"}]}}}`,
+		`{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hello\",\"yield_time_ms\":1000}"}}`,
+		`{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"c1","command":["/bin/bash","-lc","echo hello"]}}}`,
+		`{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"a1","content":[{"type":"Text","text":"doing X"}],"phase":"final_answer"}}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"doing X"}]}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":144000},"model_context_window":258400}}}`,
+	})
+	items, err := readCodex(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("want 3 items, got %d: %+v", len(items), items)
+	}
+	if items[0].Role != "user" || items[0].Text != "do X" || items[0].Marker != "4444444444444444" || items[0].Event != 2 {
+		t.Fatalf("item0 = %+v", items[0])
+	}
+	if items[1].Role != "assistant" || len(items[1].Tools) != 1 || items[1].Tools[0].Name != "Exec" {
+		t.Fatalf("item1 = %+v", items[1])
+	}
+	if items[2].Role != "assistant" || items[2].Text != "doing X" {
+		t.Fatalf("item2 = %+v", items[2])
+	}
+	if items[2].CtxUsed != 144000 || items[2].CtxWindow != 258400 {
+		t.Fatalf("item2 context = %d/%d, want 144000/258400", items[2].CtxUsed, items[2].CtxWindow)
+	}
+}
+
+func TestReadCodexTerminalError(t *testing.T) {
+	path := writeLines(t, []string{
+		`{"type":"event_msg","payload":{"type":"user_message","message":"do X"}}`,
+		`{"type":"event_msg","timestamp":"2026-08-27T07:39:51Z","payload":{"type":"task_complete","error":{"message":"Selected model is at capacity. Please try a different model.","codex_error_info":"server_overloaded"}}}`,
+	})
+	items, err := readCodex(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 || items[1].Role != "system" || items[1].Kind != "error" {
+		t.Fatalf("terminal error item missing: %+v", items)
+	}
+	want := "Selected model is at capacity. Please try a different model. (server_overloaded)"
+	if items[1].Text != want {
+		t.Fatalf("terminal error = %q, want %q", items[1].Text, want)
+	}
+}
+
+func TestReadCodexCompactEvent(t *testing.T) {
+	path := writeLines(t, []string{
+		`{"type":"event_msg","timestamp":"2026-06-15T10:00:00Z","payload":{"type":"agent_message","message":"before"}}`,
+		`{"type":"event_msg","timestamp":"2026-06-15T10:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":144000},"model_context_window":258400}}}`,
+		`{"type":"compacted","payload":{"replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"old"}]}]}}`,
+		`{"type":"event_msg","timestamp":"2026-06-15T10:00:02Z","payload":{"type":"context_compacted"}}`,
+		`{"type":"event_msg","timestamp":"2026-06-15T10:00:03Z","payload":{"type":"user_message","message":"after <!-- klax-turn:3333333333333333 -->"}}`,
+	})
+	items, err := readCodex(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("want 3 items, got %d: %+v", len(items), items)
+	}
+	if items[0].Role != "assistant" || items[0].Text != "before" || items[0].CtxUsed != 144000 {
+		t.Fatalf("item0 = %+v", items[0])
+	}
+	if items[1].Role != "tool" || items[1].Text != "🗜 Compaction: context compacted" || items[1].Time != "2026-06-15T10:00:02Z" {
+		t.Fatalf("item1 = %+v", items[1])
+	}
+	if items[2].Role != "user" || items[2].Text != "after" || items[2].Marker != "3333333333333333" {
+		t.Fatalf("item2 = %+v", items[2])
+	}
+}
+
+func TestReadCodexCompactedEventWithoutContextMessage(t *testing.T) {
+	path := writeLines(t, []string{
+		`{"timestamp":"2026-06-15T10:00:02Z","type":"compacted","payload":{"replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"old"}]}]}}`,
+		`{"type":"event_msg","payload":{"type":"user_message","message":"after <!-- klax-turn:3333333333333333 -->"}}`,
+	})
+	items, err := readCodex(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("want 2 items, got %d: %+v", len(items), items)
+	}
+	if items[0].Role != "tool" || items[0].Text != "🗜 Compaction: context compacted" || items[0].Time != "2026-06-15T10:00:02Z" {
+		t.Fatalf("item0 = %+v", items[0])
+	}
+	if items[1].Role != "user" || items[1].Text != "after" || items[1].Marker != "3333333333333333" {
+		t.Fatalf("item1 = %+v", items[1])
 	}
 }
 
@@ -97,13 +329,14 @@ func TestReadCodexHistoryToolLabels(t *testing.T) {
 		`{"type":"response_item","payload":{"type":"web_search_call","action":{"type":"search","queries":["fallback query"]}}}`,
 		`{"type":"item.started","item":{"type":"command_execution","command":"pwd"}}`,
 		`{"type":"item.started","item":{"type":"mcp_tool_call","server":"codex_apps","tool":"github_get_profile"}}`,
+		`{"type":"response_item","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"5\"}"}}`,
 	})
 	items, err := readCodex(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(items) != 10 {
-		t.Fatalf("want 10 items, got %d: %+v", len(items), items)
+	if len(items) != 11 {
+		t.Fatalf("want 11 items, got %d: %+v", len(items), items)
 	}
 	if tc := items[0].Tools[0]; tc.Name != "Edit" || !strings.Contains(tc.Label, "/tmp/x.txt") {
 		t.Fatalf("patch tool label = %+v", tc)
@@ -129,17 +362,20 @@ func TestReadCodexHistoryToolLabels(t *testing.T) {
 	if tc := items[7].Tools[0]; tc.Name != "WebSearch" || !strings.Contains(tc.Label, "fallback query") {
 		t.Fatalf("web search queries fallback label = %+v", tc)
 	}
-	if tc := items[8].Tools[0]; tc.Name != "Bash" || !strings.Contains(tc.Label, "pwd") {
+	if tc := items[8].Tools[0]; tc.Name != "Exec" || !strings.Contains(tc.Label, "pwd") {
 		t.Fatalf("item.started command label = %+v", tc)
 	}
 	if tc := items[9].Tools[0]; tc.Name != "MCP" || !strings.Contains(tc.Label, "codex_apps.github_get_profile") {
 		t.Fatalf("item.started mcp label = %+v", tc)
 	}
+	if tc := items[10].Tools[0]; tc.Name != "Wait" || tc.Label != "⏳ Wait" {
+		t.Fatalf("wait tool label = %+v", tc)
+	}
 }
 
 func TestEncodeProjectDir(t *testing.T) {
-	if got := encodeProjectDir("/home/claw"); got != "-home-claw" {
-		t.Fatalf("encodeProjectDir = %q, want -home-claw", got)
+	if got := encodeProjectDir("/home/alice"); got != "-home-alice" {
+		t.Fatalf("encodeProjectDir = %q, want -home-alice", got)
 	}
 }
 
@@ -153,5 +389,33 @@ func TestReadCodexTimestamp(t *testing.T) {
 	}
 	if len(items) != 1 || items[0].Time != "2026-06-15T10:00:00Z" {
 		t.Fatalf("codex item time = %q (want 2026-06-15T10:00:00Z)", items[0].Time)
+	}
+}
+
+func TestReadClaudeAPIErrorShowsMessageNotBareCode(t *testing.T) {
+	// A refusal arrives as an assistant row whose `error` field is only a code
+	// ("invalid_request"); the sentence naming the cause and the request id
+	// live in the message text. Rendering the code alone hides both, which
+	// reads as a transport glitch rather than the model's own answer.
+	path := writeLines(t, []string{
+		`{"type":"assistant","isApiErrorMessage":true,"error":"invalid_request","message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: refused.\n\nDetails: ` + "`[bio]`" + `\n\nRequest ID: req_abc"}]},"timestamp":"2026-08-31T11:50:14Z"}`,
+		`{"type":"assistant","isApiErrorMessage":true,"error":"API Error: Overloaded","message":{"model":"m","content":[{"type":"text","text":""}]},"timestamp":"2026-08-31T11:51:14Z"}`,
+	})
+	items, err := readClaude(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("want 2 items, got %d: %+v", len(items), items)
+	}
+	if items[0].Kind != "error" || items[0].Role != "system" {
+		t.Fatalf("item0 = %+v", items[0])
+	}
+	if !strings.Contains(items[0].Text, "req_abc") || !strings.Contains(items[0].Text, "[bio]") {
+		t.Fatalf("refusal text lost the cause or the request id: %q", items[0].Text)
+	}
+	// A line carrying no message text still reports the code it does have.
+	if items[1].Text != "API Error: Overloaded" {
+		t.Fatalf("item1 = %q, want the error field as fallback", items[1].Text)
 	}
 }

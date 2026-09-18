@@ -10,8 +10,10 @@ import (
 
 	"github.com/PiDmitrius/klax/internal/config"
 	"github.com/PiDmitrius/klax/internal/max"
+	"github.com/PiDmitrius/klax/internal/pathutil"
 	"github.com/PiDmitrius/klax/internal/tg"
 	"github.com/PiDmitrius/klax/internal/vk"
+	"github.com/PiDmitrius/klax/internal/ym"
 )
 
 func runSetup() {
@@ -34,7 +36,8 @@ func runSetup() {
 
 	// Show current values in prompts so the user knows what's already set.
 	cfg.TelegramToken = promptValidatedTokenKeep(reader, "Telegram bot token", cfg.TelegramToken, func(token string) error {
-		return tg.New(token).GetMe()
+		_, err := tg.New(token).GetMe()
+		return err
 	})
 	cfg.AllowedUsers = promptInt64ListKeep(reader, "Telegram allowed users", cfg.AllowedUsers)
 
@@ -49,6 +52,12 @@ func runSetup() {
 		return err
 	})
 	cfg.VKAllowedUsers = promptIntListKeep(reader, "VK allowed users", cfg.VKAllowedUsers)
+
+	cfg.YmToken = promptValidatedTokenKeep(reader, "Yandex Messenger bot token", cfg.YmToken, func(token string) error {
+		_, err := ym.New(token).GetMe()
+		return err
+	})
+	cfg.YmAllowedUsers = promptStringListKeep(reader, "Yandex Messenger allowed logins", cfg.YmAllowedUsers)
 
 	cfg.DefaultCWD = expandPathValue(promptStringKeep(reader, "Default working directory", displayPathValue(cfg.DefaultCWD, home)), home)
 
@@ -159,6 +168,32 @@ func promptIntListKeep(reader *bufio.Reader, label string, current []int) []int 
 	}
 }
 
+func promptStringListKeep(reader *bufio.Reader, label string, current []string) []string {
+	hint := "enter=keep empty"
+	if len(current) > 0 {
+		hint = "enter=keep " + strings.Join(current, ",")
+	}
+	fmt.Printf("%s [%s, -=clear, comma-separated]: ", label, hint)
+	line, _ := reader.ReadString('\n')
+	line = strings.TrimSpace(line)
+	switch line {
+	case "":
+		return current
+	case "-":
+		return []string{}
+	default:
+		parts := strings.Split(line, ",")
+		values := make([]string, 0, len(parts))
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part != "" {
+				values = append(values, part)
+			}
+		}
+		return values
+	}
+}
+
 func displayPathValue(path, home string) string {
 	if path == "" {
 		return ""
@@ -166,7 +201,7 @@ func displayPathValue(path, home string) string {
 	if path == home {
 		return "~"
 	}
-	return tildePath(path)
+	return pathutil.TildePathsInText(path)
 }
 
 func expandPathValue(path, home string) string {

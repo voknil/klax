@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -52,7 +53,7 @@ var (
 // ToolUse.String() — backends must normalize their native event payloads into
 // this form before constructing a ToolUse. Per-tool schemas:
 //
-//	Bash        {"command": string}
+//	Exec        {"command": string}
 //	Read        {"file_path": string}
 //	Edit        {"file_path": string}
 //	Write       {"file_path": string}
@@ -100,6 +101,21 @@ const toolPreviewLimit = 120
 // in near-full rather than being clipped to a chat-sized line.
 const UIToolPreviewLimit = 256
 
+// NormalizeToolName maps a backend's raw tool name to klax's canonical display name.
+// Command execution is "Exec" everywhere: Claude names its tool "Bash" (the shell
+// interpreter), but the tool executes a command — it is not the interpreter — so it
+// normalizes to the same Exec as Codex's command_execution / exec_command. One tool, one
+// name, one preview across both backends. Apply it at every point a raw tool name enters.
+func NormalizeToolName(name string) string {
+	switch name {
+	case "Bash":
+		return "Exec"
+	case "wait":
+		return "Wait"
+	}
+	return name
+}
+
 // String renders the tool label at the default (Telegram-width) preview limit.
 func (t ToolUse) String() string { return t.Preview(toolPreviewLimit) }
 
@@ -108,10 +124,16 @@ func (t ToolUse) String() string { return t.Preview(toolPreviewLimit) }
 // inherently short fields like file paths and patterns are never truncated.
 func (t ToolUse) Preview(limit int) string {
 	switch t.Name {
-	case "Bash":
+	case "Exec":
+		// Command execution — ONE canonical tool across both backends. Claude's "Bash",
+		// Codex's command_execution / exec_command, and the new custom_tool_call(exec)→
+		// tools.exec_command all normalize to Exec (see NormalizeToolName): the tool executes
+		// a command, it is not the Bash interpreter, so the name is shell-agnostic.
 		var inp struct{ Command string }
 		json.Unmarshal([]byte(t.Input), &inp)
-		return fmt.Sprintf("⚙️ Bash: `%s`", truncate(oneLinePreview(inp.Command), limit))
+		return fmt.Sprintf("⚙️ Exec: `%s`", truncate(oneLinePreview(inp.Command), limit))
+	case "Wait":
+		return "⏳ Wait"
 	case "Read":
 		var inp struct {
 			FilePath string `json:"file_path"`
@@ -250,6 +272,28 @@ func (t ToolUse) Preview(limit int) string {
 			return "🔌 MCP"
 		}
 		return fmt.Sprintf("🔌 MCP: %s", label)
+	case "Compaction":
+		var inp struct {
+			Trigger    string `json:"trigger"`
+			PreTokens  int    `json:"pre_tokens"`
+			PostTokens int    `json:"post_tokens"`
+			Detail     string `json:"detail"`
+		}
+		json.Unmarshal([]byte(t.Input), &inp)
+		var parts []string
+		if inp.PreTokens > 0 || inp.PostTokens > 0 {
+			parts = append(parts, fmt.Sprintf("%s→%s tokens", humanTokens(inp.PreTokens), humanTokens(inp.PostTokens)))
+		}
+		if inp.Trigger != "" {
+			parts = append(parts, inp.Trigger)
+		}
+		if inp.Detail != "" {
+			parts = append(parts, inp.Detail)
+		}
+		if len(parts) == 0 {
+			parts = append(parts, "context compacted")
+		}
+		return "🗜 Compaction: " + truncate(oneLinePreview(strings.Join(parts, " · ")), limit)
 	default:
 		return fmt.Sprintf("🔧 %s", t.Name)
 	}
@@ -263,13 +307,25 @@ func humanTokens(n int) string {
 	return fmt.Sprintf("%d", n)
 }
 
-// formatCompact renders a context-compaction boundary for the chat log.
-func formatCompact(c *CompactInfo) string {
-	trigger := c.Trigger
-	if trigger == "" {
+// CompactToolUse returns the ordinary tool-label representation of a context
+// compaction event. Backends and history readers use it so live and reload render
+// the same thing at their respective preview widths.
+func CompactToolUse(trigger string, preTokens, postTokens int, detail string) ToolUse {
+	if trigger == "" && (preTokens > 0 || postTokens > 0) {
 		trigger = "auto"
 	}
-	return fmt.Sprintf("🗜 Контекст свёрнут: %s→%s токенов (%s)", humanTokens(c.PreTokens), humanTokens(c.PostTokens), trigger)
+	b, _ := json.Marshal(struct {
+		Trigger    string `json:"trigger,omitempty"`
+		PreTokens  int    `json:"pre_tokens,omitempty"`
+		PostTokens int    `json:"post_tokens,omitempty"`
+		Detail     string `json:"detail,omitempty"`
+	}{
+		Trigger:    trigger,
+		PreTokens:  preTokens,
+		PostTokens: postTokens,
+		Detail:     detail,
+	})
+	return ToolUse{Name: "Compaction", Input: string(b)}
 }
 
 func formatRateLimit(rl *RateLimitInfo) string {
@@ -331,9 +387,14 @@ type RunOptions struct {
 	Sandbox                   string // "on" = CLI defaults, "off" = unrestricted
 	Model                     string // model override
 	Effort                    string // reasoning effort: low | medium | high (claude also: max; codex also: xhigh)
+	ContextWindowHint         int    // last known context window for progress usage that only reports used tokens
 	AppendSystemPrompt        string // appended to default system prompt
 	ClaudeTTY                 bool   // run Claude through klax tty instead of claude -p directly
 	SuppressNarrationProgress bool   // keep final-answer text buffered instead of streaming it as narration
+	// OnSessionID, if set, is called once with the backend session id the moment the run first
+	// learns it (the system/init event), BEFORE the run finishes. It lets the caller persist the id
+	// early so a brand-new session's transcript becomes addressable mid-run (durable-tail streaming).
+	OnSessionID func(string)
 }
 
 // ModelUsageInfo captures context window usage from a run.
@@ -360,12 +421,15 @@ type RunResult struct {
 type ProgressKind string
 
 const (
-	// ProgressKindTool is a tool invocation label ("⚙️ Bash: ls ~").
+	// ProgressKindTool is a tool invocation label ("⚙️ Exec: ls ~").
 	ProgressKindTool ProgressKind = "tool"
 	// ProgressKindNarration is an assistant text block that turned out not
 	// to be the final answer (another text block came after it). Frontends
 	// should render it distinctly from the final answer body.
 	ProgressKindNarration ProgressKind = "narration"
+	// ProgressKindContext is a usage-only update. Chat frontends can reflect it
+	// in an in-flight turn indicator without adding a timeline block.
+	ProgressKindContext ProgressKind = "context"
 )
 
 // ProgressEvent is a single streamed progress update.
@@ -373,12 +437,14 @@ type ProgressEvent struct {
 	Kind ProgressKind
 	Text string
 	// Tool is the structured tool invocation behind a ProgressKindTool event
-	// whose label came from a real ToolUse. It is nil for synthesized
-	// tool-kind events (rate-limit, unknown, error, compact) and for narration.
+	// whose label came from a ToolUse. It is nil for unstructured synthesized
+	// tool-kind events (rate-limit, unknown, error) and for narration.
 	// Text already holds the default-width label (ToolUse.String); a frontend
 	// with more room than Telegram re-renders this via ToolUse.Preview at a
 	// wider limit instead of consuming the clipped Text.
 	Tool *ToolUse
+	// Usage is the latest context snapshot known at this progress point.
+	Usage ModelUsageInfo
 }
 
 // ProgressFunc is called with human-readable progress updates.
@@ -547,7 +613,7 @@ func (b *narrationBuffer) markBlockBoundary() {
 }
 
 func (b *narrationBuffer) emitLocked(ev ProgressEvent) {
-	if b.closed || b.onProgress == nil || ev.Text == "" {
+	if b.closed || b.onProgress == nil || (ev.Text == "" && ev.Kind != ProgressKindContext) {
 		return
 	}
 	b.onProgress(ev)
@@ -669,6 +735,10 @@ func (r *Runner) Run(ctx context.Context, backend Backend, opts RunOptions, onPr
 	if err != nil {
 		return RunResult{Error: err}
 	}
+	var codexStartOffset int64
+	if backend.Name() == "codex" && opts.SessionID != "" {
+		codexStartOffset = codexSessionSize(opts.SessionID)
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -688,6 +758,9 @@ func (r *Runner) Run(ctx context.Context, backend Backend, opts RunOptions, onPr
 	var model string
 	var textParts []string
 	var usage ModelUsageInfo
+	if opts.ContextWindowHint > 0 {
+		usage.ContextWindow = opts.ContextWindowHint
+	}
 	var rateLimit *RateLimitInfo
 
 	// sawText tracks whether the stream emitted any assistant text block for
@@ -707,6 +780,104 @@ func (r *Runner) Run(ctx context.Context, backend Backend, opts RunOptions, onPr
 	// when a tail is held back as proof more is coming, or after a long
 	// quiet stretch with the backend still alive.
 	buf := newNarrationBuffer(onProgress, opts.SuppressNarrationProgress)
+	mergeUsage := func(next ModelUsageInfo) bool {
+		changed := false
+		if next.Model != "" && usage.Model != next.Model {
+			usage.Model = next.Model
+			changed = true
+		}
+		if next.ContextWindow > 0 && usage.ContextWindow != next.ContextWindow {
+			usage.ContextWindow = next.ContextWindow
+			changed = true
+		}
+		if next.ContextUsed > 0 && usage.ContextUsed != next.ContextUsed {
+			usage.ContextUsed = next.ContextUsed
+			changed = true
+		}
+		if next.InputTokens > 0 && usage.InputTokens != next.InputTokens {
+			usage.InputTokens = next.InputTokens
+			changed = true
+		}
+		if next.OutputTokens > 0 && usage.OutputTokens != next.OutputTokens {
+			usage.OutputTokens = next.OutputTokens
+			changed = true
+		}
+		if next.CacheRead > 0 && usage.CacheRead != next.CacheRead {
+			usage.CacheRead = next.CacheRead
+			changed = true
+		}
+		if next.CacheCreation > 0 && usage.CacheCreation != next.CacheCreation {
+			usage.CacheCreation = next.CacheCreation
+			changed = true
+		}
+		return changed
+	}
+	emitUsage := func() {
+		// Emit as soon as used tokens are known, even before the window is. Claude only
+		// reports its context window in the end-of-turn result, so a brand-new session's
+		// first turn would otherwise show no context line at all until it finished. A UI
+		// frontend renders the count live and folds in the % once the window arrives; the
+		// messenger ignores ProgressKindContext entirely, so this stays UI-only.
+		if usage.ContextUsed > 0 {
+			buf.emitTool(ProgressEvent{Kind: ProgressKindContext, Usage: usage})
+		}
+	}
+	var stopCodexMetaTail context.CancelFunc
+	startCodexMetaTail := func(threadID string) {
+		if backend.Name() != "codex" || threadID == "" || stopCodexMetaTail != nil {
+			return
+		}
+		tailCtx, cancel := context.WithCancel(ctx)
+		stopCodexMetaTail = cancel
+		tail := newCodexSessionMetaTail(threadID)
+		go func() {
+			var lastUsed, lastWindow int
+			ticker := time.NewTicker(750 * time.Millisecond)
+			defer ticker.Stop()
+			poll := func() {
+				meta, changed := tail.Poll()
+				if !changed {
+					return
+				}
+				window := meta.ContextWindow
+				if window == 0 {
+					window = opts.ContextWindowHint
+				}
+				if meta.ContextUsed > 0 && window > 0 && (meta.ContextUsed != lastUsed || window != lastWindow) {
+					lastUsed, lastWindow = meta.ContextUsed, window
+					buf.emitTool(ProgressEvent{
+						Kind: ProgressKindContext,
+						Usage: ModelUsageInfo{
+							Model:         meta.Model,
+							ContextUsed:   meta.ContextUsed,
+							ContextWindow: window,
+						},
+					})
+				}
+			}
+			poll()
+			for {
+				select {
+				case <-tailCtx.Done():
+					return
+				case <-ticker.C:
+					poll()
+				}
+			}
+		}()
+	}
+	stopCodexMetaTailIfRunning := func() {
+		if stopCodexMetaTail != nil {
+			stopCodexMetaTail()
+			stopCodexMetaTail = nil
+		}
+	}
+	defer stopCodexMetaTailIfRunning()
+
+	// A resumed codex run reuses the session id we passed and may never re-emit a system
+	// event carrying it, so seed the live context tail from the id we already know. New runs
+	// pass "" (no-op), and a later EventSystem is a no-op via startCodexMetaTail's guard.
+	startCodexMetaTail(sessionID)
 
 	// resultErr holds a failure the backend reported mid-stream (an errored
 	// `result`/error event). We record it but keep reading so the stream still
@@ -747,7 +918,12 @@ func (r *Runner) Run(ctx context.Context, backend Backend, opts RunOptions, onPr
 			switch ev.Type {
 			case EventSystem:
 				if ev.SessionID != "" {
+					first := sessionID == ""
 					sessionID = ev.SessionID
+					startCodexMetaTail(sessionID)
+					if first && opts.OnSessionID != nil {
+						opts.OnSessionID(sessionID) // persist early so a new session's transcript is tail-addressable now
+					}
 				}
 				if ev.Model != "" {
 					model = ev.Model
@@ -775,17 +951,17 @@ func (r *Runner) Run(ctx context.Context, backend Backend, opts RunOptions, onPr
 				// emitting the tool so the log order matches the stream.
 				buf.demote()
 				tool := ev.Tool
-				buf.emitTool(ProgressEvent{Kind: ProgressKindTool, Text: tool.String(), Tool: &tool})
-				if ev.Usage.ContextUsed > 0 {
-					usage.ContextUsed = ev.Usage.ContextUsed
+				if mergeUsage(ev.Usage) {
+					emitUsage()
 				}
+				buf.emitTool(ProgressEvent{Kind: ProgressKindTool, Text: tool.String(), Tool: &tool, Usage: usage})
 
 			case EventText:
 				r.mu.Lock()
 				r.current = ToolUse{}
 				r.mu.Unlock()
-				if ev.Usage.ContextUsed > 0 {
-					usage.ContextUsed = ev.Usage.ContextUsed
+				if mergeUsage(ev.Usage) {
+					emitUsage()
 				}
 				if buf.append(ev.Text, false) {
 					sawText = true
@@ -843,10 +1019,12 @@ func (r *Runner) Run(ctx context.Context, backend Backend, opts RunOptions, onPr
 					if !opts.SuppressNarrationProgress {
 						buf.demote()
 					}
-					buf.emitTool(ProgressEvent{Kind: ProgressKindTool, Text: formatCompact(ev.Compact)})
+					tool := CompactToolUse(ev.Compact.Trigger, ev.Compact.PreTokens, ev.Compact.PostTokens, "")
+					buf.emitTool(ProgressEvent{Kind: ProgressKindTool, Text: tool.String(), Tool: &tool})
 				}
 
 			case EventResult:
+				stopCodexMetaTailIfRunning()
 				// `result` marks the end of one agent-loop iteration, not
 				// the end of the run. claude -p --output-format stream-json
 				// keeps the loop alive while background tasks (run_in_background,
@@ -876,28 +1054,11 @@ func (r *Runner) Run(ctx context.Context, backend Backend, opts RunOptions, onPr
 				if ev.Text != "" && !sawText {
 					textParts = append(textParts, ev.Text)
 				}
-				// Merge usage from result event.
-				if ev.Usage.Model != "" {
-					usage.Model = ev.Usage.Model
-				}
-				if ev.Usage.ContextWindow > 0 {
-					usage.ContextWindow = ev.Usage.ContextWindow
-				}
-				if ev.Usage.ContextUsed > 0 {
-					usage.ContextUsed = ev.Usage.ContextUsed
-				}
-				if ev.Usage.InputTokens > 0 {
-					usage.InputTokens = ev.Usage.InputTokens
-				}
-				if ev.Usage.OutputTokens > 0 {
-					usage.OutputTokens = ev.Usage.OutputTokens
-				}
-				if ev.Usage.CacheRead > 0 {
-					usage.CacheRead = ev.Usage.CacheRead
-				}
-				if ev.Usage.CacheCreation > 0 {
-					usage.CacheCreation = ev.Usage.CacheCreation
-				}
+				// Merge usage from result event. Do not emit a context progress update here:
+				// result is immediately followed by final delivery, where the timeline prints
+				// the end-of-turn context once. Updating the dots right before removing them
+				// creates a visible but meaningless flicker.
+				mergeUsage(ev.Usage)
 			}
 		}
 	}
@@ -926,6 +1087,17 @@ func (r *Runner) Run(ctx context.Context, backend Backend, opts RunOptions, onPr
 		return RunResult{
 			SessionID: sessionID,
 			Error:     fmt.Errorf("%s: %w", backend.Name(), ctx.Err()),
+		}
+	}
+
+	// The rollout is the canonical source of a codex terminal failure. The read is
+	// scoped to the bytes this run appended, so a resume that dies without writing
+	// its own task_complete cannot inherit an older turn's error.
+	if backend.Name() == "codex" && sessionID != "" {
+		if terminal := readCodexTaskCompleteSince(sessionID, codexStartOffset); terminal != "" {
+			buf.demote()
+			_ = buf.drain()
+			return RunResult{SessionID: sessionID, Error: errors.New(terminal)}
 		}
 	}
 

@@ -162,6 +162,7 @@ type fakeEditCall struct {
 	chatID  string
 	message string
 	text    string
+	replyTo string
 	format  string
 }
 
@@ -177,6 +178,7 @@ type fakeTransport struct {
 		chatID  string
 		message string
 		text    string
+		replyTo string
 		format  string
 	}
 }
@@ -208,12 +210,13 @@ func (f *fakeTransport) SendMessageReturnID(chatID, text, replyTo, format string
 	return id, nil
 }
 
-func (f *fakeTransport) EditMessage(chatID, messageID, text, format string) error {
+func (f *fakeTransport) EditMessage(chatID, messageID, text, replyTo, format string) error {
 	f.editCalls++
-	f.editLog = append(f.editLog, fakeEditCall{chatID: chatID, message: messageID, text: text, format: format})
+	f.editLog = append(f.editLog, fakeEditCall{chatID: chatID, message: messageID, text: text, replyTo: replyTo, format: format})
 	f.lastEdit.chatID = chatID
 	f.lastEdit.message = messageID
 	f.lastEdit.text = text
+	f.lastEdit.replyTo = replyTo
 	f.lastEdit.format = format
 	if f.editErr != nil && format != "" {
 		return f.editErr
@@ -235,7 +238,7 @@ func TestTryEditTreatsNotModifiedAsSuccess(t *testing.T) {
 	tp := &fakeTransport{
 		editErr: &transport.APIError{Platform: "tg", Code: 400, Description: "message is not modified"},
 	}
-	if err := tryEdit(context.Background(), tp, "chat", "msg", "same", "html"); err != nil {
+	if err := tryEdit(context.Background(), tp, "chat", "msg", "same", "", "html"); err != nil {
 		t.Fatalf("expected not modified to be ignored, got %v", err)
 	}
 	if tp.editCalls != 1 {
@@ -247,7 +250,7 @@ func TestTryEditFallsBackToPlainFormat(t *testing.T) {
 	tp := &fakeTransport{
 		editErr: &transport.APIError{Platform: "tg", Code: 400, Description: "bad format"},
 	}
-	err := tryEdit(context.Background(), tp, "chat", "msg", "<b>hello</b>", "html")
+	err := tryEdit(context.Background(), tp, "chat", "msg", "<b>hello</b>", "", "html")
 	if err != nil {
 		t.Fatalf("expected plain fallback to succeed, got %v", err)
 	}
@@ -358,6 +361,34 @@ func TestSyncMessageChainSkipsCachedEdits(t *testing.T) {
 	}
 }
 
+func TestSyncMessageChainResendsReplyToOnEdit(t *testing.T) {
+	tp := &fakeTransport{}
+	d := newTestDeliveryDaemon(tp)
+	ctx := context.Background()
+	chain := newMessageChain()
+
+	chain, err := d.syncMessageChain(ctx, "tg:1", "user-msg-1", chain, "hello", "html")
+	if err != nil {
+		t.Fatalf("first sync failed: %v", err)
+	}
+	if tp.sendLog[0].replyTo != "user-msg-1" {
+		t.Fatalf("expected first send to carry replyTo, got %+v", tp.sendLog[0])
+	}
+
+	// Editing the same message (e.g. progress placeholder -> final answer)
+	// must resend the original replyTo: ym's "edit" is the same sendText
+	// call used to send, and silently drops the reply link if it's omitted.
+	if _, err = d.syncMessageChain(ctx, "tg:1", "user-msg-1", chain, "hello, edited", "html"); err != nil {
+		t.Fatalf("edit sync failed: %v", err)
+	}
+	if tp.editCalls != 1 {
+		t.Fatalf("expected one edit call, got %d", tp.editCalls)
+	}
+	if tp.lastEdit.replyTo != "user-msg-1" {
+		t.Fatalf("edit should resend the original replyTo, got %q", tp.lastEdit.replyTo)
+	}
+}
+
 func TestSyncMessageChainKeepsFollowupChunkUnrepliedWithoutGap(t *testing.T) {
 	tp := &fakeTransport{sendIDs: []string{"first", "second"}}
 	d := newTestDeliveryDaemon(tp)
@@ -409,6 +440,45 @@ func TestSyncMessageChainRepliesAfterInboundGap(t *testing.T) {
 	}
 }
 
+func TestSyncMessageChainResendsReplyToOnEditAfterGapAppend(t *testing.T) {
+	tp := &fakeTransport{sendIDs: []string{"first", "second"}}
+	d := newTestDeliveryDaemon(tp)
+	ctx := context.Background()
+
+	chain, err := d.syncMessageChainChunks(ctx, "tg:1", "user-msg", nil, []string{"chunk one"}, "html")
+	if err != nil {
+		t.Fatalf("first sync failed: %v", err)
+	}
+
+	d.bumpChatActivity("tg:1")
+
+	chain, err = d.syncMessageChainChunks(ctx, "tg:1", "user-msg", chain, []string{"chunk one", "chunk two"}, "html")
+	if err != nil {
+		t.Fatalf("second sync failed: %v", err)
+	}
+	if len(chain.ids) != 2 {
+		t.Fatalf("expected exactly 2 chain ids, got %v", chain.ids)
+	}
+	if chain.replyTos[chain.ids[1]] != "user-msg" {
+		t.Fatalf("expected the gap-appended second chunk to be recorded as a reply, got %+v", chain.replyTos)
+	}
+
+	// Edit both chunks (different content so neither hits the cache) — the
+	// second chunk was created as a reply too (append-after-gap), not just
+	// the first, so its edit must resend replyTo just the same.
+	if _, err = d.syncMessageChainChunks(ctx, "tg:1", "user-msg", chain, []string{"chunk one edited", "chunk two edited"}, "html"); err != nil {
+		t.Fatalf("third sync failed: %v", err)
+	}
+	if tp.editCalls != 2 {
+		t.Fatalf("expected 2 edit calls, got %d", tp.editCalls)
+	}
+	for _, call := range tp.editLog {
+		if call.replyTo != "user-msg" {
+			t.Errorf("edit of message %q lost replyTo, got %q", call.message, call.replyTo)
+		}
+	}
+}
+
 func TestSyncMessageChainDoesNotReplyForAppendedChunkWhenReusingExistingMessageWithoutGap(t *testing.T) {
 	tp := &fakeTransport{sendIDs: []string{"second"}}
 	d := newTestDeliveryDaemon(tp)
@@ -431,5 +501,114 @@ func TestSyncMessageChainDoesNotReplyForAppendedChunkWhenReusingExistingMessageW
 		if call.replyTo != "" {
 			t.Fatalf("expected appended chunk %d without reply when no gap happened, got %q", i, call.replyTo)
 		}
+	}
+}
+
+// countFences reports how many lines are a ``` fence marker (with or without
+// a language tag) — used to assert each chunk's fences are balanced (even
+// count) rather than one chunk ending mid-block.
+func countFences(chunk string) int {
+	n := 0
+	for _, line := range strings.Split(chunk, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			n++
+		}
+	}
+	return n
+}
+
+func TestSplitMessagePlainKeepsFenceBalanced(t *testing.T) {
+	var lines []string
+	for i := 0; i < 40; i++ {
+		lines = append(lines, strings.Repeat("x", 10)+" line")
+	}
+	text := "Ответ:\n```go\n" + strings.Join(lines, "\n") + "\n```\nхвост"
+	chunks := splitMessage(text, 100, "")
+	if len(chunks) < 2 {
+		t.Fatalf("expected multiple chunks, got %d", len(chunks))
+	}
+	for i, chunk := range chunks {
+		if len(chunk) > 100 {
+			t.Fatalf("chunk %d too large: %d bytes", i, len(chunk))
+		}
+		if n := countFences(chunk); n%2 != 0 {
+			t.Fatalf("chunk %d has unbalanced fence markers (%d): %q", i, n, chunk)
+		}
+	}
+	// The code content must survive the split (modulo the reopened ``` markers).
+	var rebuilt strings.Builder
+	for _, chunk := range chunks {
+		for _, line := range strings.Split(chunk, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "```") {
+				continue
+			}
+			rebuilt.WriteString(line)
+			rebuilt.WriteString("\n")
+		}
+	}
+	for _, l := range lines {
+		if !strings.Contains(rebuilt.String(), l) {
+			t.Fatalf("lost code line %q after split", l)
+		}
+	}
+}
+
+func TestSplitMessagePlainOversizedLineInsideFenceStaysBalanced(t *testing.T) {
+	huge := strings.Repeat("x", 3000)
+	text := "```\n" + huge + "\n```"
+	limit := 2048
+	chunks := splitMessage(text, limit, "")
+	if len(chunks) < 2 {
+		t.Fatalf("expected multiple chunks, got %d", len(chunks))
+	}
+	// maxMessageLen is a soft one-message target, not a hard API ceiling
+	// (real platform limits sit well above it) — a chunk may overshoot it by
+	// the reopened fence marker's own size (see splitPlainFencedMessage), so
+	// this only guards against something unbounded, not the deliberate slack.
+	const overshootBudget = 32
+	for i, chunk := range chunks {
+		if len(chunk) > limit+overshootBudget {
+			t.Fatalf("chunk %d way over budget: %d bytes", i, len(chunk))
+		}
+		if n := countFences(chunk); n%2 != 0 {
+			t.Fatalf("chunk %d has unbalanced fence markers (%d): %q", i, n, chunk)
+		}
+	}
+	var rebuilt strings.Builder
+	for _, chunk := range chunks {
+		for _, line := range strings.Split(chunk, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "```") {
+				continue
+			}
+			rebuilt.WriteString(line)
+		}
+	}
+	if rebuilt.String() != huge {
+		t.Fatalf("oversized line corrupted after split: got %d chars, want %d", len(rebuilt.String()), len(huge))
+	}
+}
+
+func TestSplitMessagePlainShortFenceStaysWhole(t *testing.T) {
+	text := "before\n```go\nfmt.Println(1)\n```\nafter"
+	chunks := splitMessage(text, 2048, "")
+	if len(chunks) != 1 || chunks[0] != text {
+		t.Fatalf("short fenced text should pass through unchanged, got %q", chunks)
+	}
+}
+
+func TestSplitMessagePlainNoFenceUsesFastPath(t *testing.T) {
+	text := strings.Repeat("no code here ", 30)
+	chunks := splitMessage(text, 50, "")
+	if len(chunks) < 2 {
+		t.Fatalf("expected multiple chunks, got %d", len(chunks))
+	}
+	var rebuilt strings.Builder
+	for _, c := range chunks {
+		rebuilt.WriteString(c)
+	}
+	// splitPlainMessage skips the newline it split on — none exists here, so
+	// a straight concatenation must reproduce the source exactly.
+	if rebuilt.String() != text {
+		t.Fatalf("text mismatch after fence-free split")
 	}
 }

@@ -69,6 +69,10 @@ func (d *daemon) newMessengerDelivery(ctx context.Context, msg queuedMsg, verbos
 	needsRedirectMarker := !reuseQueuedProgress && msg.progressID != ""
 	if reuseQueuedProgress {
 		progressChain = newMessageChain(msg.progressID)
+		// The queued placeholder was created (in enqueueToSession) as a reply
+		// to msg.msgID — record that so its first edit here resends it too
+		// (ym needs reply_message_id on every edit or it drops the link).
+		progressChain.replyTos[msg.progressID] = msg.msgID
 		progressChain.lastCreateActivity = msg.progressSeq
 	}
 	if t != nil {
@@ -85,6 +89,7 @@ func (d *daemon) newMessengerDelivery(ctx context.Context, msg queuedMsg, verbos
 			_, _ = d.performTransportOp(markerCtx, transportOp{
 				fullChatID: msg.chatID,
 				messageID:  msg.progressID,
+				replyTo:    msg.msgID,
 				text:       "↓",
 				format:     "",
 			})
@@ -150,6 +155,9 @@ func (m *messengerDelivery) startWorker() {
 // Progress is the runner.ProgressFunc. It runs in the stdout-scanner goroutine
 // and only ever appends and does a non-blocking mailbox send — never network.
 func (m *messengerDelivery) Progress(ev runner.ProgressEvent) {
+	if ev.Kind == runner.ProgressKindContext {
+		return
+	}
 	if !m.verbose {
 		return
 	}
@@ -175,6 +183,13 @@ func (m *messengerDelivery) Progress(ev runner.ProgressEvent) {
 	}
 }
 
+func (m *messengerDelivery) Warning(text string) {
+	m.logItems = append(m.logItems, runner.ProgressEvent{
+		Kind: runner.ProgressKindTool,
+		Text: "⚠️ " + text,
+	})
+}
+
 // stopWorker flushes the progress worker: the worker mutates chain, so any
 // final-delivery path that reads chain must run this barrier first. Idempotent.
 func (m *messengerDelivery) stopWorker() {
@@ -190,15 +205,15 @@ func (m *messengerDelivery) Final(res runner.RunResult) {
 	d := m.d
 
 	if res.Error != nil {
-		finalText := formatRunFailure(m.logItems, m.chatFmt, res.Error)
+		finalChunks := formatRunFailureChunks(m.logItems, m.chatFmt, res.Error)
 		if m.hasTransport {
 			// Deliver with chatFmt so a rich-formatted failure goes out as a Rich
 			// Message (and reuses the rich-born progress chain when present).
-			if _, err := d.syncFinalMessageChain(m.chatID, m.replyTo, m.chain, finalText, m.chatFmt); err != nil {
+			if _, err := d.syncFinalMessageChainChunks(m.chatID, m.replyTo, m.chain, finalChunks, m.chatFmt); err != nil {
 				log.Printf("final error delivery failed: %v", err)
 			}
 		} else {
-			d.sendMessage(m.chatID, m.replyTo, finalText)
+			d.sendMessage(m.chatID, m.replyTo, strings.Join(finalChunks, "\n\n"))
 		}
 		return
 	}

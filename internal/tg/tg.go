@@ -15,7 +15,8 @@ import (
 	"github.com/PiDmitrius/klax/internal/transport"
 )
 
-const apiBase = "https://api.telegram.org/bot"
+// apiBase is a var (not const) so tests can point it at an httptest.Server.
+var apiBase = "https://api.telegram.org/bot"
 
 type Bot struct {
 	token  string
@@ -107,13 +108,16 @@ type Audio struct {
 }
 
 type User struct {
-	ID       int64  `json:"id"`
-	Username string `json:"username"`
+	ID        int64  `json:"id"`
+	Username  string `json:"username"`
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
 }
 
 type Chat struct {
-	ID   int64  `json:"id"`
-	Type string `json:"type"`
+	ID    int64  `json:"id"`
+	Type  string `json:"type"`
+	Title string `json:"title"`
 }
 
 // --- API calls ---
@@ -161,10 +165,18 @@ func (b *Bot) call(method string, payload interface{}) (json.RawMessage, error) 
 	return result.Result, nil
 }
 
-// GetMe calls the getMe API to validate the bot token.
-func (b *Bot) GetMe() error {
-	_, err := b.call("getMe", struct{}{})
-	return err
+// GetMe calls the getMe API to validate the bot token and fetch its identity
+// (Username in particular — used to recognize an @mention as a group trigger).
+func (b *Bot) GetMe() (*User, error) {
+	raw, err := b.call("getMe", struct{}{})
+	if err != nil {
+		return nil, err
+	}
+	var u User
+	if err := json.Unmarshal(raw, &u); err != nil {
+		return nil, err
+	}
+	return &u, nil
 }
 
 // SetMyCommands sets the bot's command menu visible to users.
@@ -233,6 +245,7 @@ func (b *Bot) sendMsg(chatID, text, replyTo, format string) (string, error) {
 		payload["rich_message"] = map[string]interface{}{"html": text}
 	} else {
 		payload["text"] = text
+		payload["disable_web_page_preview"] = true
 		switch format {
 		case "markdown":
 			payload["parse_mode"] = "Markdown"
@@ -302,7 +315,9 @@ func (b *Bot) DownloadFile(fileID string) ([]byte, string, error) {
 	return data, name, nil
 }
 
-func (b *Bot) EditMessage(chatID, messageID, text, format string) error {
+// EditMessage edits an existing message. replyTo is unused — Telegram's
+// editMessageText never touches the reply relationship set at creation.
+func (b *Bot) EditMessage(chatID, messageID, text, replyTo, format string) error {
 	msgID, _ := strconv.Atoi(messageID)
 	payload := map[string]interface{}{
 		"chat_id":    chatID,
@@ -313,6 +328,7 @@ func (b *Bot) EditMessage(chatID, messageID, text, format string) error {
 		payload["rich_message"] = map[string]interface{}{"html": text}
 	} else {
 		payload["text"] = text
+		payload["disable_web_page_preview"] = true
 		switch format {
 		case "markdown":
 			payload["parse_mode"] = "Markdown"

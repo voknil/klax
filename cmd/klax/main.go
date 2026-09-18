@@ -8,10 +8,12 @@ import (
 	"os"
 )
 
-const version = "0.6.40"
+const version = "0.7.418"
 
 func main() {
 	log.SetPrefix("klax: ")
+	// Every log line leaves through here; see redactSecrets.
+	log.SetOutput(redactingWriter{w: log.Writer()})
 
 	if len(os.Args) < 2 {
 		printUsage()
@@ -40,6 +42,8 @@ func main() {
 		runUninstall()
 	case "update":
 		runUpdate()
+	case "reinstall":
+		runReinstall()
 	case "fallback":
 		runFallback()
 	case "setup":
@@ -62,6 +66,7 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  stop        Stop the service")
 	fmt.Fprintln(os.Stderr, "  restart     Restart the service")
 	fmt.Fprintln(os.Stderr, "  update      Download latest release and restart")
+	fmt.Fprintln(os.Stderr, "  reinstall   Rebuild source without a version bump and restart")
 	fmt.Fprintln(os.Stderr, "  status      Show service status")
 	fmt.Fprintln(os.Stderr, "  fallback    Install latest release from GitHub")
 	fmt.Fprintln(os.Stderr, "  version     Print version")

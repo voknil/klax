@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,29 +20,29 @@ import (
 
 	"github.com/PiDmitrius/klax/internal/config"
 	"github.com/PiDmitrius/klax/internal/history"
+	"github.com/PiDmitrius/klax/internal/inbound"
+	"github.com/PiDmitrius/klax/internal/pathutil"
 	"github.com/PiDmitrius/klax/internal/session"
 )
 
 // uiPrefix is the chatID/transport prefix for the web UI. A request authenticated
-// as canonical user "claw" is handled as chatID "ui:claw", and sessionKey maps
-// that to "user:claw" — the same key tg/mx DMs for claw resolve to, so the UI
+// as canonical user "alice" is handled as chatID "ui:alice", and sessionKey maps
+// that to "user:alice" — the same key tg/mx DMs for alice resolve to, so the UI
 // shares sessions with the messengers (cross-channel continuity).
 const uiPrefix = "ui"
 
-// Per-user event ring. Every broadcast event gets a monotonic seq and is retained
-// here so a long-poll can return exactly what a client missed since its cursor
-// ("<epoch>-<seq>"). Bounded by count and bytes; a cursor that predates the ring
-// (overflow) gets `reload` and re-syncs from the transcript. The ring is the only
-// delivery buffer — there is no per-connection state.
+// Per-user NOTICE ring. CONTENT is delivered by the durable-tail poll (/api/tail) from the durable
+// log; only transient notices are retained here, so a client catches the ones it missed since its
+// notice cursor ("<epoch>-<seq>"). Bounded by count and bytes; a cursor that predates the ring
+// (overflow) or a changed epoch (restart) resets it — notices are lost on restart by nature.
 const (
 	uiRingMaxItems = 512
 	uiRingMaxBytes = 8 << 20
 )
 
-// uiPollHold is how long /api/poll holds a request open when there is nothing new
-// before returning an empty batch (the client then re-polls). Well under typical
-// proxy/browser request limits; a cut request is just re-issued from the same
-// cursor (idempotent), so the exact value is not load-bearing.
+// uiPollHold is how long /api/tail holds a request open when there is nothing new before returning
+// a session-strip refresh (the client then re-polls). Well under typical proxy/browser limits; a
+// cut request is just re-issued from the same cursors (idempotent), so the value is not load-bearing.
 const uiPollHold = 25 * time.Second
 
 // uiMaxInflightPerUser bounds concurrently-held polls per user — cheap hygiene
@@ -50,6 +52,7 @@ const uiMaxInflightPerUser = 32
 
 // uiSessionInfo is one tab in the strip.
 type uiSessionInfo struct {
+	ReadOnly  bool   `json:"read_only"`
 	Created   int64  `json:"created"`
 	Name      string `json:"name"`
 	Active    bool   `json:"active"`
@@ -61,17 +64,29 @@ type uiSessionInfo struct {
 	Messages  int    `json:"messages"`
 	CtxUsed   int    `json:"ctx_used"`
 	CtxWindow int    `json:"ctx_window"`
+	// Durable unread state. ReadThrough is the "<turn>.<block>"
+	// watermark the client seeds its divider from; Unread is the exchange count the badge shows
+	// for a tab the client has not loaded (a loaded tab counts precisely client-side).
+	ReadThrough string `json:"read_through,omitempty"`
+	Unread      int    `json:"unread,omitempty"`
+	// Groups the session belongs to. The client filters the strip and derives the whole group list
+	// from this — there is no group registry and no /api/groups.
+	Groups []string `json:"groups,omitempty"`
 }
 
 // uiEvent is one server-sent event. The client multiplexes all tabs over a
 // single stream and routes by Session (a session's Created).
 type uiEvent struct {
-	Type      string          `json:"type"` // sessions|turn_start|progress|final|error|notice|compact|user
-	Seq       uint64          `json:"seq,omitempty"`   // monotonic id for client dedupe; set by emitLocked
+	Type      string          `json:"type"`            // sessions|turn_start|context|progress|final|error|notice|user
+	Seq       uint64          `json:"seq,omitempty"`   // monotonic id for client dedupe + unread; set by emitLocked
 	Nonce     string          `json:"nonce,omitempty"` // user-event: the sender's send nonce, so it skips its own echo
 	Session   int64           `json:"session,omitempty"`
-	Kind      string          `json:"kind,omitempty"` // progress: tool|narration
+	TurnSeq   int64           `json:"turn_seq,omitempty"` // per-turn id: routes turn-scoped events to a turn's slot
+	State     string          `json:"state,omitempty"`    // turn state this event sets: enq|run|done|err (read-model)
+	Block     *uiBlock        `json:"block,omitempty"`    // progress/final/error: the answer block (with its stable id)
+	Kind      string          `json:"kind,omitempty"`     // progress: tool|narration
 	Text      string          `json:"text,omitempty"`
+	Time      string          `json:"time,omitempty"`
 	Markdown  string          `json:"markdown,omitempty"`
 	Sessions  []uiSessionInfo `json:"sessions,omitempty"`
 	Model     string          `json:"model,omitempty"`
@@ -100,19 +115,42 @@ type ringItem struct {
 	data json.RawMessage
 }
 
-// uiHub retains events per canonical user for long-poll delivery. Every event gets
-// a monotonic seq (under mu) and is kept in a bounded per-user ring; a poll reads
-// events with seq>cursor. epoch is the process lifetime: a restart changes it, so a
-// client with a stale-epoch cursor is told to reload. notify wakes held polls;
-// inflight bounds concurrent held polls per user. There is no per-connection state.
+// uiHub wakes held tail-polls (notify) and retains only NOTICES per canonical user (seq under mu,
+// bounded ring; the tail poll reads notices with seq>cursor). epoch is the process lifetime — a
+// restart changes it, which the tail reports as `started` (the "klax обновился" banner) and which
+// resets the notice cursor. inflight bounds concurrent held polls. There is no per-connection state.
+// uiUnreadKey keys the read-model cache. readModelEntry caches a session's built rows by the
+// transcript's AND queue's (mtime,size), so an unchanged session's rows — for the unread count AND
+// the live tail — cost two os.Stat calls, not a transcript read + rebuild.
+type uiUnreadKey struct {
+	sk      string
+	created int64
+}
+type readModelEntry struct {
+	tMtime    time.Time
+	tSize     int64
+	qMtime    time.Time
+	qSize     int64
+	busy      bool // buildReadModel input NOT captured by the file stats — key on it so a busy⇄idle
+	ctxWindow int  // flip / ctx-window change can never serve a stale cached read model
+	rows      []uiTurn
+}
+
 type uiHub struct {
 	mu       sync.Mutex
 	epoch    int64
 	seq      uint64
-	ring     map[string][]ringItem    // per-user retained events
-	ringSz   map[string]int           // per-user ring byte size
-	notify   map[string]chan struct{} // per-user wake channel (closed-channel broadcast)
-	inflight map[string]int           // per-user concurrently-held polls
+	ring     map[string][]ringItem           // per-user retained events
+	ringSz   map[string]int                  // per-user ring byte size
+	notify   map[string]chan struct{}        // per-user wake channel (closed-channel broadcast)
+	inflight map[string]int                  // per-user concurrently-held polls
+	known    map[string]struct{}             // every user that has ever polled — notice-broadcast target set
+	acked    map[string]uint64               // newest notice seq acknowledged by each active browser tab
+	ackWake  chan struct{}                   // closed/replaced whenever an acknowledgement advances
+	clients  map[string]map[string]time.Time // recently polling browser tabs per canonical user
+	sessRev  map[string]uint64               // per-user session-strip revision — bumped on every broadcastSessions
+	rmMu     sync.Mutex                      // guards rm (read-model cache; separate from mu — off the poll hot path)
+	rm       map[uiUnreadKey]readModelEntry
 }
 
 func newUIHub() *uiHub {
@@ -122,6 +160,12 @@ func newUIHub() *uiHub {
 		ringSz:   make(map[string]int),
 		notify:   make(map[string]chan struct{}),
 		inflight: make(map[string]int),
+		known:    make(map[string]struct{}),
+		acked:    make(map[string]uint64),
+		ackWake:  make(chan struct{}),
+		clients:  make(map[string]map[string]time.Time),
+		sessRev:  make(map[string]uint64),
+		rm:       make(map[uiUnreadKey]readModelEntry),
 	}
 }
 
@@ -150,6 +194,7 @@ func (h *uiHub) head() uint64 {
 func (h *uiHub) enterPoll(user string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.known[user] = struct{}{} // remember this user so notice broadcasts reach them even between polls
 	if h.inflight[user] >= uiMaxInflightPerUser {
 		return false
 	}
@@ -168,27 +213,30 @@ func (h *uiHub) leavePoll(user string) {
 	}
 }
 
-// emitLocked assigns the next seq, stamps it into the payload (so the client can
-// dedupe), appends the marshaled event to the user's ring (trimming to the caps),
-// and wakes any held polls for that user. Caller holds h.mu.
+// emitLocked wakes any held tail-poll for the user, and — for NOTICES only — retains the event in
+// the small per-user ring under a monotonic notice seq. Notices are the one transient broadcast
+// left (command output / banners); CONTENT is recovered from the durable log by the tail, so it is
+// NOT retained — a content emit just notifies. The notify ALWAYS fires (it is the tail-poll wake).
+// Caller holds h.mu.
 func (h *uiHub) emitLocked(user string, ev uiEvent) {
-	h.seq++
-	ev.Seq = h.seq
-	data, err := json.Marshal(ev)
-	if err != nil {
-		log.Printf("ui: marshal event: %v", err)
-		return // seq is burned, but a single skipped seq is invisible to the cursor
+	if ev.Type == "notice" {
+		h.seq++
+		ev.Seq = h.seq
+		if data, err := json.Marshal(ev); err == nil {
+			items := append(h.ring[user], ringItem{seq: h.seq, data: data})
+			sz := h.ringSz[user] + len(data)
+			for len(items) > 1 && (len(items) > uiRingMaxItems || sz > uiRingMaxBytes) {
+				sz -= len(items[0].data)
+				items[0] = ringItem{} // drop the ref so it can be GC'd despite the backing array
+				items = items[1:]
+			}
+			h.ring[user] = items
+			h.ringSz[user] = sz
+		} else {
+			log.Printf("ui: marshal notice: %v", err)
+		}
 	}
-	items := append(h.ring[user], ringItem{seq: h.seq, data: data})
-	sz := h.ringSz[user] + len(data)
-	for len(items) > 1 && (len(items) > uiRingMaxItems || sz > uiRingMaxBytes) {
-		sz -= len(items[0].data)
-		items[0] = ringItem{} // drop the ref so it can be GC'd despite the backing array
-		items = items[1:]
-	}
-	h.ring[user] = items
-	h.ringSz[user] = sz
-	if ch := h.notify[user]; ch != nil { // wake held polls; the next waiter makes a fresh channel
+	if ch := h.notify[user]; ch != nil { // wake held tail-polls; the next waiter makes a fresh channel
 		close(ch)
 		delete(h.notify, user)
 	}
@@ -217,39 +265,150 @@ func (h *uiHub) collect(user string, cursorEpoch int64, cursorSeq uint64) (event
 	return events, head, false
 }
 
-// broadcast queues one event for a user and retains it for the next poll.
+// broadcast queues one event for a user (only notices are retained; see emitLocked).
 func (h *uiHub) broadcast(user string, ev uiEvent) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.emitLocked(user, ev)
 }
 
-// broadcastAll queues one event for every user the hub knows about (has retained
-// events for, or is currently polling) — daemon-wide banners (restart/update).
-func (h *uiHub) broadcastAll(ev uiEvent) {
+// poke wakes any held tail-poll for the user WITHOUT retaining anything — for CONTENT changes, which
+// the tail recovers from the durable log. (Session-strip changes use bumpSessions.)
+func (h *uiHub) poke(user string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if ch := h.notify[user]; ch != nil {
+		close(ch)
+		delete(h.notify, user)
+	}
+}
+
+// bumpSessions advances the user's session-strip revision and wakes held polls. The revision lets
+// handleTail return a sessions-only change (rename/create/close/cross-tab read) immediately rather
+// than holding until the timeout — content still has no retained state, but the strip does now.
+func (h *uiHub) bumpSessions(user string) {
+	if user == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.sessRev[user]++
+	if ch := h.notify[user]; ch != nil {
+		close(ch)
+		delete(h.notify, user)
+	}
+}
+
+// sessionsRev is the user's current session-strip revision (the client echoes its last-seen value
+// back on the next tail so the server can detect a strip change with no content tail).
+func (h *uiHub) sessionsRev(user string) uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.sessRev[user]
+}
+
+// broadcastAll queues one event for every user the hub knows about (has ever polled, has retained
+// events, or is currently polling) — daemon-wide banners (restart/update). Since durable-tail
+// removed retained content events, an active user often has no ring/inflight entry in the gap
+// between two tail requests; `known` keeps the banner from being dropped for them.
+func (h *uiHub) broadcastAll(ev uiEvent) map[string]uint64 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	seen := make(map[string]struct{})
+	for user := range h.known {
+		seen[user] = struct{}{}
+	}
 	for user := range h.ring {
 		seen[user] = struct{}{}
 	}
 	for user := range h.inflight {
 		seen[user] = struct{}{}
 	}
+	targets := make(map[string]uint64, len(seen))
 	for user := range seen {
 		h.emitLocked(user, ev)
+		for client, seenAt := range h.clients[user] {
+			if time.Since(seenAt) <= time.Minute {
+				targets[uiClientKey(user, client)] = h.seq
+			} else {
+				delete(h.clients[user], client)
+				delete(h.acked, uiClientKey(user, client))
+			}
+		}
+	}
+	return targets
+}
+
+func uiClientKey(user, client string) string { return user + "\x00" + client }
+
+func (h *uiHub) observeClient(user, client, cursor string) {
+	if client == "" {
+		return
+	}
+	epoch, seq, ok := parseCursor(cursor)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	clients := h.clients[user]
+	if clients == nil {
+		clients = make(map[string]time.Time)
+		h.clients[user] = clients
+	}
+	for id, seenAt := range clients {
+		if time.Since(seenAt) > time.Minute {
+			delete(clients, id)
+			delete(h.acked, uiClientKey(user, id))
+		}
+	}
+	if _, exists := clients[client]; !exists && len(clients) >= uiMaxInflightPerUser*2 {
+		return
+	}
+	clients[client] = time.Now()
+	key := uiClientKey(user, client)
+	if ok && epoch == h.epoch && seq > h.acked[key] {
+		h.acked[key] = seq
+		close(h.ackWake)
+		h.ackWake = make(chan struct{})
+	}
+}
+
+func (h *uiHub) waitAcknowledged(targets map[string]uint64, timeout time.Duration) {
+	if len(targets) == 0 {
+		return
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		h.mu.Lock()
+		pending := false
+		for user, seq := range targets {
+			if h.acked[user] < seq {
+				pending = true
+				break
+			}
+		}
+		wake := h.ackWake
+		h.mu.Unlock()
+		if !pending {
+			return
+		}
+		select {
+		case <-wake:
+		case <-timer.C:
+			return
+		}
 	}
 }
 
 // uiNotifyAll pushes a notice to every connected UI client (any user).
-func (d *daemon) uiNotifyAll(text string) {
+func (d *daemon) uiNotifyAll(text string) map[string]uint64 {
 	if d.uiHub == nil {
-		return
+		return nil
 	}
-	d.uiHub.broadcastAll(uiEvent{Type: "notice", Text: text})
+	return d.uiHub.broadcastAll(uiEvent{Type: "notice", Text: text})
 }
 
-// uiEmit marshals and broadcasts one event to a user. No-op when the UI is off.
+// uiEmit marshals and broadcasts one event to a user. No-op when the UI is off. Only NOTICES
+// travel this path now; content and session-strip changes use uiPoke.
 func (d *daemon) uiEmit(user string, ev uiEvent) {
 	if d.uiHub == nil || user == "" {
 		return
@@ -257,13 +416,23 @@ func (d *daemon) uiEmit(user string, ev uiEvent) {
 	d.uiHub.broadcast(user, ev)
 }
 
-// broadcastSessions pushes the current tab-strip snapshot to the UI client(s)
-// watching this session key. Cheap no-op when the UI is off or nobody watches.
+// uiPoke wakes a user's held tail-polls (a CONTENT change — delivered from the durable log by the
+// tail). No-op when UI is off. Session-strip changes use broadcastSessions (which also bumps the rev).
+func (d *daemon) uiPoke(user string) {
+	if d.uiHub == nil || user == "" {
+		return
+	}
+	d.uiHub.poke(user)
+}
+
+// broadcastSessions signals a session-strip change: it bumps the user's strip revision AND wakes
+// held polls, so the next tail returns the fresh snapshot IMMEDIATELY (rev differs) instead of
+// parking until the hold timeout when there is no content tail. No-op when the UI is off.
 func (d *daemon) broadcastSessions(sk string) {
 	if d.uiHub == nil {
 		return
 	}
-	d.uiEmit(uiUserForKey(sk), uiEvent{Type: "sessions", Sessions: d.sessionsSnapshot(sk)})
+	d.uiHub.bumpSessions(uiUserForKey(sk))
 }
 
 func (d *daemon) uiUserForChat(chatID string) string {
@@ -279,16 +448,50 @@ func (d *daemon) queuedCount(sk string, created int64) int {
 	}
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
-	return len(sr.queue)
+	n := len(sr.queue)
+	if n > 0 && !sr.processing && !sr.runner.IsBusy() {
+		n--
+	}
+	return n
 }
 
-// newUISession creates a fresh active session for a UI chat and returns it so
-// the caller can switch the client to it.
-func (d *daemon) newUISession(sk, chatID string) *session.Session {
-	sess, _ := d.createSession(chatID, sk, "session")
-	d.saveStore()
+func (d *daemon) createUISessionAtomic(sk, chatID string, patch uiSettingsPatch) (*session.Session, error) {
+	def := d.scopeDefaults(sk)
+	backend := resolveSessionBackend(nil, def, d.cfg.GetDefaultBackend())
+	// Seed a message-less session from the scope defaults (what createSession would have produced),
+	// then validate + apply the draft on it — all in memory, before the store is touched.
+	sess := &session.Session{
+		Name:          "session",
+		Backend:       backend,
+		ModelOverride: def.Model,
+		ThinkOverride: def.Think,
+		Sandbox:       effectiveSandboxMode(def, nil),
+		ClaudeTTY:     def.ClaudeTTY && backend == "claude",
+		CWD:           d.defaultSessionCWD(chatID, sk),
+	}
+	if draftHasFields(patch) {
+		r, err := validateSettingsPatch(sess, backend, false, patch) // fresh session: never busy/locked
+		if err != nil {
+			return nil, err
+		}
+		applySettingsPatch(sess, r)
+	}
+	newDefaults := session.ScopeDefaults{
+		Backend:      resolveSessionBackend(sess, def, d.cfg.GetDefaultBackend()),
+		Model:        sess.ModelOverride,
+		Think:        sess.ThinkOverride,
+		Sandbox:      sess.Sandbox,
+		ClaudeTTY:    sess.ClaudeTTY,
+		CWD:          sess.CWD,
+		GroupMode:    def.GroupMode,
+		GroupVerbose: def.GroupVerbose,
+	}
+	created, err := d.store.AddPersisted(sk, sess, &newDefaults)
+	if err != nil {
+		return nil, &uiErr{http.StatusInternalServerError, "Не удалось сохранить сессию"}
+	}
 	d.broadcastSessions(sk)
-	return sess
+	return created, nil
 }
 
 // renameSession renames one session (by Created) and pushes the updated tab strip.
@@ -305,6 +508,17 @@ func (d *daemon) renameSession(sk string, created int64, name string) bool {
 	return true
 }
 
+// reorderSessions applies the tab strip's drag-and-drop order (by Created id) and
+// pushes the updated strip. A no-op order change persists nothing.
+func (d *daemon) reorderSessions(sk string, order []int64) bool {
+	if !d.store.Reorder(sk, order) {
+		return false
+	}
+	d.saveStore()
+	d.broadcastSessions(sk)
+	return true
+}
+
 // closeSession aborts any in-flight run on a session and removes it (the
 // transcript JSONL stays on disk). Refuses the last remaining session; promotes
 // a new active one if the closed tab was active. Mirrors the /nuke teardown
@@ -312,7 +526,7 @@ func (d *daemon) renameSession(sk string, created int64, name string) bool {
 func (d *daemon) closeSession(sk string, created int64) error {
 	sessions := d.store.SessionsFor(sk)
 	if len(sessions) <= 1 {
-		return errors.New("нельзя закрыть последнюю сессию")
+		return errors.New("Нельзя закрыть последнюю сессию")
 	}
 	idx, wasActive := -1, false
 	for i, s := range sessions {
@@ -322,10 +536,11 @@ func (d *daemon) closeSession(sk string, created int64) error {
 		}
 	}
 	if idx == -1 {
-		return errors.New("сессия не найдена")
+		return errors.New("Сессия не найдена")
 	}
 	d.abortSession(sk, created, true)
-	d.store.Delete(sk, idx)
+	d.store.DeleteCreated(sk, created)
+	d.removeSessionStore(sk, created) // latch + delete the runner-owned store before dropping it
 	d.dropRunner(sk, created)
 	if wasActive {
 		d.store.Switch(sk, 0) // promote the first remaining session
@@ -335,7 +550,7 @@ func (d *daemon) closeSession(sk string, created int64) error {
 	return nil
 }
 
-func (d *daemon) sessionsSnapshot(sk string) []uiSessionInfo {
+func (d *daemon) sessionsSnapshot(sk string, readOnly bool) []uiSessionInfo {
 	sessions := d.store.SessionsFor(sk)
 	out := make([]uiSessionInfo, 0, len(sessions))
 	for _, s := range sessions {
@@ -347,39 +562,145 @@ func (d *daemon) sessionsSnapshot(sk string) []uiSessionInfo {
 		if model == "" {
 			model = s.Model
 		}
+		readTurn, readBlock := s.ReadThrough(readOnly)
+		// Unread answer-block count for a tab the client has not loaded (a loaded tab ignores this
+		// and counts client-side). Stat-cached, so an unchanged session costs only an os.Stat.
+		unread := d.sessionUnread(sk, s, readOnly)
 		out = append(out, uiSessionInfo{
-			Created:   s.Created,
-			Name:      s.Name,
-			Active:    s.Active,
-			Busy:      d.isSessionBusy(sk, s.Created),
-			Queued:    d.queuedCount(sk, s.Created),
-			Backend:   backend,
-			Model:     model,
-			CWD:       s.CWD,
-			Messages:  s.Messages,
-			CtxUsed:   s.ContextUsed,
-			CtxWindow: s.ContextWindow,
+			Created:     s.Created,
+			ReadOnly:    readOnly,
+			Name:        s.Name,
+			Active:      s.Active,
+			Busy:        d.isSessionBusy(sk, s.Created),
+			Queued:      d.queuedCount(sk, s.Created),
+			Backend:     backend,
+			Model:       model,
+			CWD:         pathutil.TildePathsInText(s.CWD),
+			Messages:    s.Messages,
+			CtxUsed:     s.ContextUsed,
+			CtxWindow:   s.ContextWindow,
+			ReadThrough: fmt.Sprintf("%d.%d", readTurn, readBlock),
+			Unread:      unread,
+			Groups:      s.Groups,
 		})
 	}
 	return out
 }
 
-// buildUITokens maps each configured ui_token to its canonical user. It rejects
-// an empty id on a token-bearing user and duplicate tokens; the token itself is
-// never echoed into the error (privacy).
-func buildUITokens(users []config.UserIdentity) (map[string]string, error) {
-	tokens := make(map[string]string)
+// sessionUnread returns a session's unread answer-block count for its tab badge — a loaded tab
+// ignores this and counts client-side; this serves tabs the client has NOT loaded (finding B). It
+// is cheap: readModel is cached, so this is a recount over cached rows.
+func (d *daemon) sessionUnread(sk string, sess *session.Session, readOnly bool) int {
+	turn, block := sess.ReadThrough(readOnly)
+	return unreadAfter(d.readModel(sk, sess), turn, block)
+}
+
+// readModel builds a session's full read-model rows (durable queue ⋈ transcript) — the SAME rows
+// the client renders, so server and client agree on one path (live delivery and reload converge on
+// buildReadModel). It is a stat-keyed MEMOIZATION of buildReadModel, not a delivery channel: the key
+// is EVERY input — the transcript's and queue's (mtime,size) plus the two non-file inputs (busy,
+// ctxWindow) — so a hit is provably identical to a rebuild, and any change rebuilds once.
+func (d *daemon) readModel(sk string, sess *session.Session) []uiTurn {
+	st := d.sessionStore(sk, sess.Created)
+	if st == nil {
+		return nil
+	}
+	backend := sess.Backend
+	if backend == "" {
+		backend = "claude"
+	}
+	tm, ts, _ := history.Stat(backend, sess.ID, sess.CWD)
+	qm, qs := st.QueueStat()
+	busy := d.isSessionBusy(sk, sess.Created)
+	cw := sess.ContextWindow
+	key := uiUnreadKey{sk: sk, created: sess.Created}
+	if d.uiHub != nil {
+		h := d.uiHub
+		h.rmMu.Lock()
+		if e, ok := h.rm[key]; ok && e.tSize == ts && e.tMtime.Equal(tm) && e.qSize == qs && e.qMtime.Equal(qm) && e.busy == busy && e.ctxWindow == cw {
+			h.rmMu.Unlock()
+			return e.rows
+		}
+		h.rmMu.Unlock()
+	}
+	items, _ := history.Load(backend, sess.ID, sess.CWD)
+	queueTurns, _ := st.InboundLog()
+	rows := d.buildReadModel(sk, sess.Created, groupTurns(items), queueTurns, nil, busy, 0, true, cw)
+	if d.uiHub != nil {
+		h := d.uiHub
+		h.rmMu.Lock()
+		h.rm[key] = readModelEntry{tMtime: tm, tSize: ts, qMtime: qm, qSize: qs, busy: busy, ctxWindow: cw, rows: rows}
+		h.rmMu.Unlock()
+	}
+	return rows
+}
+
+// sessionTail is the live tail of a session's read model past a per-session
+// (turn,block,state,trail,head) cursor — the rows the client merges to catch up. Empty when nothing
+// is new past the cursor. [S3]
+func (d *daemon) sessionTail(sk string, sess *session.Session, throughTurn int64, throughBlock int, throughState string, throughTrail int, head int64) []uiTurn {
+	return tailFrom(d.readModel(sk, sess), throughTurn, throughBlock, throughState, throughTrail, head)
+}
+
+// watchRunTranscript pokes the user's tail whenever the active run's transcript FILE changes, so a
+// block that lands in the file wakes the held poll even when no further stdout progress event
+// follows (klax does not own the transcript write, and a stdout event can precede the file append).
+// A brand-new session has no transcript address (id) at run start, so it waits for idKnown first.
+// Polls history.Stat on a short tick until stop is closed (the run returns). No-op when UI is off.
+func (d *daemon) watchRunTranscript(stop <-chan struct{}, idKnown <-chan string, backendName, cwd, sk string, created int64, initialID string) {
+	if d.uiHub == nil {
+		return
+	}
+	id := initialID
+	if id == "" {
+		select {
+		case id = <-idKnown:
+		case <-stop:
+			return
+		}
+	}
+	user := uiUserForKey(sk)
+	var lastM time.Time
+	var lastS int64
+	ticker := time.NewTicker(300 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			if m, s, ok := history.Stat(backendName, id, cwd); ok && (s != lastS || !m.Equal(lastM)) {
+				lastM, lastS = m, s
+				d.reconcileBindings(sk, created, backendName, id, cwd)
+				d.uiPoke(user)
+			}
+		}
+	}
+}
+
+type uiAccess struct {
+	User     string `json:"user"`
+	ReadOnly bool   `json:"read_only"`
+}
+
+func buildUITokens(users []config.UserIdentity) (map[string]uiAccess, error) {
+	tokens := make(map[string]uiAccess)
 	for _, u := range users {
-		if u.UIToken == "" {
-			continue
+		for _, entry := range []struct {
+			token    string
+			readOnly bool
+		}{{u.UIToken, false}, {u.UIReadToken, true}} {
+			if entry.token == "" {
+				continue
+			}
+			if u.ID == "" {
+				return nil, fmt.Errorf("ui: token owner has an empty id")
+			}
+			if _, dup := tokens[entry.token]; dup {
+				return nil, fmt.Errorf("ui: duplicate access token in config")
+			}
+			tokens[entry.token] = uiAccess{User: u.ID, ReadOnly: entry.readOnly}
 		}
-		if u.ID == "" {
-			return nil, fmt.Errorf("ui: user with a ui_token has an empty id")
-		}
-		if _, dup := tokens[u.UIToken]; dup {
-			return nil, fmt.Errorf("ui: duplicate ui_token in config")
-		}
-		tokens[u.UIToken] = u.ID
 	}
 	return tokens, nil
 }
@@ -403,7 +724,7 @@ func (t *uiTransport) SendMessageReturnID(chatID, text, replyTo, format string) 
 	return "ui-notice", nil
 }
 
-func (t *uiTransport) EditMessage(chatID, messageID, text, format string) error {
+func (t *uiTransport) EditMessage(chatID, messageID, text, replyTo, format string) error {
 	t.d.uiEmit(t.d.uiUserForChat(chatID), uiEvent{Type: "notice", Text: text})
 	return nil
 }
@@ -413,7 +734,7 @@ func (t *uiTransport) EditMessage(chatID, messageID, text, format string) error 
 type uiServer struct {
 	d      *daemon
 	addr   string
-	tokens map[string]string // token -> canonical user
+	tokens map[string]uiAccess // token -> user and access role
 }
 
 func (s *uiServer) Name() string { return uiPrefix }
@@ -456,45 +777,92 @@ func isLoopbackAddr(addr string) bool {
 
 func (s *uiServer) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/poll", s.handlePoll)
+	mux.HandleFunc("/api/auth", s.handleAuth)
+	mux.HandleFunc("/api/tail", s.handleTail)
 	mux.HandleFunc("/api/send", s.handleSend)
 	mux.HandleFunc("/api/abort", s.handleAbort)
+	mux.HandleFunc("/api/read", s.handleRead)
 	mux.HandleFunc("/api/new", s.handleNew)
 	mux.HandleFunc("/api/rename", s.handleRename)
+	mux.HandleFunc("/api/reorder", s.handleReorder)
 	mux.HandleFunc("/api/close", s.handleClose)
 	mux.HandleFunc("/api/sessions", s.handleSessions)
 	mux.HandleFunc("/api/settings", s.handleSettings)
+	mux.HandleFunc("/api/system", s.handleSystem)
+	mux.HandleFunc("/api/system/check", s.handleSystemCheck)
+	mux.HandleFunc("/api/system/update", s.handleSystemUpdate)
 	mux.HandleFunc("/api/transcript", s.handleTranscript)
+	mux.HandleFunc("/api/file", s.handleFile)
 	mux.HandleFunc("/emoji/", s.handleEmoji)
 	mux.HandleFunc("/", s.handleSPA)
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/file" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			s.handleFile(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			access, ok := s.access(r)
+			if !ok {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			if access.ReadOnly && !readerRequest(r) {
+				writeAPIError(w, apiFailure("read-only"))
+				return
+			}
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 // auth resolves the bearer token (Authorization header) to a canonical user. Every
 // UI request — including the long-poll — sets the header (fetch can), so there is
 // no ?token= query path to widen token-in-URL leakage.
-func (s *uiServer) auth(r *http.Request) (string, bool) {
+func (s *uiServer) access(r *http.Request) (uiAccess, bool) {
 	h := r.Header.Get("Authorization")
 	if !strings.HasPrefix(h, "Bearer ") {
-		return "", false
+		return uiAccess{}, false
 	}
-	u, ok := s.tokens[strings.TrimPrefix(h, "Bearer ")]
-	return u, ok
+	access, ok := s.tokens[strings.TrimPrefix(h, "Bearer ")]
+	return access, ok
+}
+
+func (s *uiServer) auth(r *http.Request) (string, bool) {
+	access, ok := s.access(r)
+	return access.User, ok
+}
+
+func (s *uiServer) readOnly(r *http.Request) bool {
+	access, _ := s.access(r)
+	return access.ReadOnly
+}
+
+// Readers may change only their own watermark; all other routes are denied by default.
+func readerRequest(r *http.Request) bool {
+	if r.Method == http.MethodGet {
+		switch r.URL.Path {
+		case "/api/auth", "/api/sessions", "/api/settings", "/api/system", "/api/transcript", "/api/file":
+			return true
+		}
+	}
+	return r.Method == http.MethodPost && (r.URL.Path == "/api/tail" || r.URL.Path == "/api/read")
+}
+
+func (s *uiServer) handleAuth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	access, _ := s.access(r)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(access)
 }
 
 func (s *uiServer) chatID(user string) string { return uiPrefix + ":" + user }
 
-// pollResponse is the /api/poll body: events since the cursor, the new cursor to
-// send next, and a reload flag when the cursor is uncoverable.
-type pollResponse struct {
-	Epoch  int64             `json:"epoch"`
-	Cursor string            `json:"cursor"`
-	Events []json.RawMessage `json:"events,omitempty"`
-	Reload bool              `json:"reload,omitempty"`
-}
-
-// parseCursor splits a "<epoch>-<seq>" poll cursor. ok=false on an absent/blank
-// cursor (a fresh client).
+// parseCursor splits a "<epoch>-<seq>" cursor — now only the transient-notice cursor. ok=false on
+// an absent/blank cursor (a fresh client).
 func parseCursor(v string) (epoch int64, seq uint64, ok bool) {
 	i := strings.IndexByte(v, '-')
 	if i <= 0 {
@@ -512,163 +880,328 @@ func (s *uiServer) cursorString(seq uint64) string {
 	return strconv.FormatInt(s.d.uiHub.epoch, 10) + "-" + strconv.FormatUint(seq, 10)
 }
 
-// handlePoll is the long-poll delivery endpoint. The client sends its cursor
-// ("<epoch>-<seq>"); the server returns the user's events with seq>cursor, holding
-// the request up to uiPollHold when there is nothing new (returning an empty batch
-// on timeout, so the client re-polls). Ordinary request/response — no streaming,
-// no heartbeat, no per-connection state — so any proxy handles it, and a cut
-// request is just re-issued from the same cursor (idempotent, no loss).
-func (s *uiServer) handlePoll(w http.ResponseWriter, r *http.Request) {
+// --- durable-tail poll ---
+// The live channel as a tail of the durable log: the client sends a per-session
+// "<turn>.<block>.<state>.<trail>[.<head>]" cursor, the server returns the read-model rows past it
+// (built by the SAME buildReadModel as a reload, so live and reload converge). No epoch/ring/reload
+// for CONTENT — content is recovered from the durable log. `notice` stays a ring cursor: notices are
+// transient broadcasts, not durable, so they keep a small retained buffer (the only surviving ring role).
+type tailReq struct {
+	Cursors map[string]string `json:"cursors"`  // created -> "<turn>.<block>.<state>.<trail>[.<head>]"
+	Notice  string            `json:"notice"`   // ring cursor for transient notices
+	SessRev uint64            `json:"sess_rev"` // last session-strip revision the client rendered
+	Client  string            `json:"client"`   // page-lifetime id: restart notices are flushed to every active tab
+}
+type tailSessionData struct {
+	Rows   []uiTurn `json:"rows"`
+	Cursor string   `json:"cursor"` // new content cursor after these rows
+}
+type tailResp struct {
+	Started  int64                      `json:"started"` // hub epoch — a change means the daemon restarted
+	Startup  string                     `json:"startup"` // installed|started — canonical outcome of this process start
+	Version  string                     `json:"version"`
+	Sessions []uiSessionInfo            `json:"sessions"`
+	Tails    map[string]tailSessionData `json:"tails,omitempty"`
+	Notices  []string                   `json:"notices,omitempty"`
+	Notice   string                     `json:"notice"`
+	SessRev  uint64                     `json:"sess_rev"` // current session-strip revision (client echoes it back)
+}
+
+// parseBlockCursor splits a "<turn>.<block>.<state>.<trail>[.<head>]" content cursor (block may be
+// -1 for a turn with no answer yet; the state code, trail, and head are absent on a legacy cursor).
+// `trail` is the number of trailing non-durable rows after the last
+// durable turn — it lets a standalone appended AFTER the last turn be delivered live exactly once.
+// `head` is the newest durable turn the client has seen (only present when the cursor anchors on an
+// OLDER still-running turn behind a queued one); it defaults to `turn` so a normal/legacy cursor is
+// unchanged. Absent/blank ⇒ (0,-1,"",0,0) so a brand-new tab's first tail returns from the start.
+func parseBlockCursor(v string) (turn int64, block int, state string, trail int, head int64) {
+	parts := strings.SplitN(v, ".", 5)
+	if len(parts) < 2 {
+		return 0, -1, "", 0, 0
+	}
+	turn, _ = strconv.ParseInt(parts[0], 10, 64)
+	block, _ = strconv.Atoi(parts[1])
+	if len(parts) >= 3 {
+		state = parts[2]
+	}
+	if len(parts) >= 4 {
+		trail, _ = strconv.Atoi(parts[3])
+	}
+	head = turn // no separate head ⇒ the cursor anchor IS the newest turn seen
+	if len(parts) >= 5 {
+		head, _ = strconv.ParseInt(parts[4], 10, 64)
+	}
+	return turn, block, state, trail, head
+}
+
+// tailCursor is the position after applying `rows` — "<turn>.<block>.<state>.<trail>[.<head>]". The
+// anchor (turn/block/state) is the OLDEST turn that is still UNSETTLED (enq/run): the cursor must not
+// advance past it, so its later blocks and its completion are still delivered. When every turn is
+// settled, the anchor is simply the last durable turn (the plain case). `trail` is the count of
+// standalone rows after the last durable turn; `head` is the last durable turn's seq — emitted only
+// when it is NEWER than the anchor (a queued turn sitting behind the still-running one), so the tail
+// can tell a genuinely new turn from the already-seen queued one. State code + trail also advance the
+// cursor on a pure enq→run transition or a trailing standalone with no new block.
+func tailCursor(rows []uiTurn) string {
+	var head, aTurn int64
+	aBlock := -1
+	aState := ""
+	trail := 0
+	anchored := false // locked onto the oldest unsettled turn — do not advance the anchor past it
+	for _, t := range rows {
+		if t.Role == "user" && t.Seq > 0 {
+			head, trail = t.Seq, 0
+			if !anchored {
+				aTurn, aBlock, aState = t.Seq, len(t.Blocks)-1, t.State
+				anchored = t.State == "enq" || t.State == "run"
+			}
+		} else {
+			trail++ // a standalone / non-durable row after the last durable turn
+		}
+	}
+	if anchored && aTurn != head {
+		return fmt.Sprintf("%d.%d.%s.%d.%d", aTurn, aBlock, stateCode(aState), trail, head)
+	}
+	return fmt.Sprintf("%d.%d.%s.%d", aTurn, aBlock, stateCode(aState), trail)
+}
+
+func (s *uiServer) buildTail(user, sk string, req tailReq, readOnly bool) tailResp {
+	// Read the strip revision BEFORE the snapshot. A concurrent bumpSessions between the two must
+	// never pair a NEWER rev with an OLDER snapshot: the client would ack a strip change it never
+	// rendered, then stop re-requesting it (its next rev matches the server's) and stay stale until a
+	// later wake/timeout. Since bumpSessions mutates the store BEFORE incrementing the rev, a snapshot
+	// taken after `rev` reflects at least rev's state — so resp.SessRev is never ahead of Sessions,
+	// and any bump after `rev` instead closes the wake channel and drives a rebuild.
+	rev := s.d.uiHub.sessionsRev(user)
+	resp := tailResp{Started: s.d.uiHub.epoch, Startup: s.d.startupKind, Version: version, Sessions: s.d.sessionsSnapshot(sk, readOnly), SessRev: rev}
+	for createdStr, cur := range req.Cursors {
+		created, err := strconv.ParseInt(createdStr, 10, 64)
+		if err != nil {
+			continue
+		}
+		sess := s.d.store.Get(sk, created)
+		if sess == nil {
+			continue
+		}
+		ct, cb, cs, ctr, chd := parseBlockCursor(cur)
+		rows := s.d.sessionTail(sk, sess, ct, cb, cs, ctr, chd)
+		if len(rows) == 0 {
+			continue
+		}
+		if resp.Tails == nil {
+			resp.Tails = make(map[string]tailSessionData)
+		}
+		resp.Tails[createdStr] = tailSessionData{Rows: rows, Cursor: tailCursor(rows)}
+	}
+	// Notices ride the ring (the one transient broadcast left). A reload here just resets the
+	// notice cursor — notices are lost on restart by nature, no replay needed.
+	noticeEpoch, noticeSeq, _ := parseCursor(req.Notice)
+	events, head, reload := s.d.uiHub.collect(user, noticeEpoch, noticeSeq)
+	if !reload {
+		for _, raw := range events {
+			var ev uiEvent
+			if json.Unmarshal(raw, &ev) == nil && ev.Type == "notice" {
+				resp.Notices = append(resp.Notices, ev.Text)
+			}
+		}
+	}
+	resp.Notice = s.cursorString(head)
+	return resp
+}
+
+// handleTail is the durable-tail long-poll: hold on the per-user notify until any watched session
+// has content past its cursor (or a notice), then return the tail rows + refreshed session strip.
+func (s *uiServer) handleTail(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.auth(r)
 	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	// Ensure the user has at least one session so the client's /api/sessions load
-	// (cold start) has something to render.
 	sk := s.d.sessionKey(s.chatID(user))
-	s.d.ensureSessionWithCWD(sk, s.d.sessionCWD(s.chatID(user)))
-
+	if !s.readOnly(r) {
+		s.d.ensureSessionWithCWD(sk, s.d.sessionCWD(s.chatID(user)))
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 
-	cursorEpoch, cursorSeq, hasCursor := parseCursor(r.URL.Query().Get("cursor"))
-
-	// Fresh client (no cursor): just establish the cursor at the current head and
-	// return immediately. Content comes from the client's /api/sessions + transcript
-	// load; subsequent polls deliver everything after this head.
-	if !hasCursor {
-		s.writePoll(w, pollResponse{Epoch: s.d.uiHub.epoch, Cursor: s.cursorString(s.d.uiHub.head())})
+	var req tailReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
-
 	if !s.d.uiHub.enterPoll(user) {
-		http.Error(w, "too many concurrent polls", http.StatusTooManyRequests)
+		http.Error(w, "Too many concurrent polls", http.StatusTooManyRequests)
 		return
 	}
 	defer s.d.uiHub.leavePoll(user)
+	s.d.uiHub.observeClient(user, req.Client, req.Notice)
 
 	deadline := time.NewTimer(uiPollHold)
 	defer deadline.Stop()
-	for {
-		ch := s.d.uiHub.waitChan(user) // grab BEFORE collect (lost-wakeup-safe)
-		events, head, reload := s.d.uiHub.collect(user, cursorEpoch, cursorSeq)
-		if reload {
-			s.writePoll(w, pollResponse{Epoch: s.d.uiHub.epoch, Cursor: s.cursorString(head), Reload: true})
-			return
-		}
-		if len(events) > 0 {
-			s.writePoll(w, pollResponse{Epoch: s.d.uiHub.epoch, Cursor: s.cursorString(head), Events: events})
-			return
-		}
-		select {
-		case <-ch:
-			// woken by an emit for this user — re-collect
-		case <-deadline.C:
-			// nothing new within the hold — empty batch; head has no events for this
-			// user in (cursor, head], so advancing the cursor to head loses nothing.
-			s.writePoll(w, pollResponse{Epoch: s.d.uiHub.epoch, Cursor: s.cursorString(head)})
-			return
-		case <-r.Context().Done():
-			return
-		}
+	ch := s.d.uiHub.waitChan(user) // grab BEFORE building (lost-wakeup-safe)
+	resp := s.buildTail(user, sk, req, s.readOnly(r))
+	// Return immediately on new content, a notice, OR a session-strip change the client hasn't seen
+	// (resp.SessRev past the client's last-rendered rev). The rev catches a rename/create/close/
+	// cross-tab-read whose wake was lost because this request arrived just after it — without it,
+	// such a strip-only change would park here until the hold timeout (up to uiPollHold).
+	if len(resp.Tails) > 0 || len(resp.Notices) > 0 || resp.SessRev != req.SessRev {
+		_ = json.NewEncoder(w).Encode(resp)
+		return
 	}
-}
-
-func (s *uiServer) writePoll(w http.ResponseWriter, resp pollResponse) {
-	_ = json.NewEncoder(w).Encode(resp)
+	// Nothing new yet — hold until ANY emit for this user (content, a notice, a session-strip
+	// change such as a cross-tab POST /api/read), then return a FRESH build so the snapshot and
+	// any tails land promptly; on timeout return the current strip so badges never go stale.
+	select {
+	case <-ch:
+		_ = json.NewEncoder(w).Encode(s.buildTail(user, sk, req, s.readOnly(r)))
+	case <-deadline.C:
+		_ = json.NewEncoder(w).Encode(resp)
+	case <-r.Context().Done():
+	}
 }
 
 func (s *uiServer) handleSend(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.auth(r)
 	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	// While draining for a restart the daemon refuses new turns (enqueue drops them
-	// with only an SSE notice). Tell the client explicitly so it rolls back the
-	// optimistic echo instead of leaving a ghost message that never reaches a turn
-	// and lingers in localStorage until the reconcile TTL.
-	if s.d.isDraining() {
-		http.Error(w, "klax перезапускается — попробуйте через минуту", http.StatusServiceUnavailable)
-		return
-	}
+	// Accept-during-drain: do NOT refuse here. enqueueToSession durably persists the
+	// message and lets startup replay run it after the restart — the single
+	// acceptance decision lives there, so a UI send during drain is not lost.
 	// Cap the whole request body (attachments included) so a buggy or hostile
 	// client cannot exhaust memory/disk while parsing.
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<20)
 	var (
-		text          string
-		nonce         string
-		targetCreated int64
-		attachments   []attachment
+		text                string
+		nonce               string
+		returnOn            = "queued"
+		nonceRaw, returnRaw json.RawMessage
+		targetCreated       int64
+		attachments         []attachment
 	)
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
 		if err := r.ParseMultipartForm(32 << 20); err != nil {
-			http.Error(w, "bad multipart", http.StatusBadRequest)
+			http.Error(w, "Bad multipart", http.StatusBadRequest)
 			return
 		}
+		defer r.MultipartForm.RemoveAll()
 		text = r.FormValue("text")
-		nonce = r.FormValue("nonce")
+		if values, ok := r.MultipartForm.Value["nonce"]; ok {
+			if len(values) != 1 {
+				http.Error(w, "Invalid nonce", http.StatusBadRequest)
+				return
+			}
+			nonceRaw, _ = json.Marshal(values[0])
+		}
+		if values, ok := r.MultipartForm.Value["return_on"]; ok {
+			if len(values) != 1 {
+				http.Error(w, "Invalid return_on", http.StatusBadRequest)
+				return
+			}
+			returnRaw, _ = json.Marshal(values[0])
+		}
 		targetCreated, _ = strconv.ParseInt(r.FormValue("session"), 10, 64)
 		for _, fh := range r.MultipartForm.File["files"] {
 			f, err := fh.Open()
 			if err != nil {
-				continue
+				http.Error(w, "Не удалось прочитать вложение", http.StatusBadRequest)
+				return
 			}
 			data, err := io.ReadAll(f)
 			f.Close()
 			if err != nil {
-				continue
+				http.Error(w, "Не удалось прочитать вложение", http.StatusBadRequest)
+				return
 			}
 			attachments = append(attachments, attachment{filename: fh.Filename, data: data})
 		}
 	} else {
 		var body struct {
-			Session int64  `json:"session"`
-			Text    string `json:"text"`
-			Nonce   string `json:"nonce"`
+			Session  int64           `json:"session"`
+			Text     string          `json:"text"`
+			Nonce    json.RawMessage `json:"nonce"`
+			ReturnOn json.RawMessage `json:"return_on"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
+		if err := decodeAPIRequest(r.Body, &body, false); err != nil {
+			http.Error(w, "Bad request", http.StatusBadRequest)
 			return
 		}
 		text = body.Text
-		nonce = body.Nonce
+		nonceRaw, returnRaw = body.Nonce, body.ReturnOn
 		targetCreated = body.Session
 	}
 	// The UI always targets a specific tab; never silently fall back to the
 	// active session the way the messenger paths do.
 	if targetCreated <= 0 {
-		http.Error(w, "a positive session is required", http.StatusBadRequest)
+		http.Error(w, "A positive session is required", http.StatusBadRequest)
 		return
 	}
-	// Refuse a send to a tab whose session no longer exists (e.g. closed from
-	// another client): enqueue would drop it with only an SSE notice while we'd
-	// still answer 204, stranding the client's optimistic echo as a ghost. A 404
-	// lets the client roll it back. (Mirrors handleAbort's existence check.)
-	if s.d.store.Get(s.d.sessionKey(s.chatID(user)), targetCreated) == nil {
-		http.Error(w, "session not found", http.StatusNotFound)
+	var parseErr *apiError
+	nonce, parseErr = optionalNonemptyString(nonceRaw, "nonce", "")
+	if parseErr != nil {
+		writeAPIError(w, parseErr)
+		return
+	}
+	returnOn, parseErr = optionalNonemptyString(returnRaw, "return_on", "queued")
+	if parseErr != nil {
+		writeAPIError(w, parseErr)
+		return
+	}
+	if returnOn != "queued" && returnOn != "start" && returnOn != "finish" {
+		writeAPIError(w, &apiError{Code: "invalid-return-on", Message: "Неизвестное значение return_on", status: http.StatusBadRequest})
+		return
+	}
+	if nonce == "" {
+		var value [16]byte
+		if _, err := rand.Read(value[:]); err != nil {
+			writeAPIError(w, apiFailure("enqueue-failed"))
+			return
+		}
+		nonce = hex.EncodeToString(value[:])
+	}
+	if strings.TrimSpace(text) == "" && len(attachments) == 0 {
+		writeAPIError(w, &apiError{Code: "empty-message", Message: "Сообщение пусто", status: http.StatusBadRequest})
+		return
+	}
+	if !s.requireSession(w, s.d.sessionKey(s.chatID(user)), targetCreated) {
 		return
 	}
 	// The accepted user message is echoed to every UI tab from the common accept
 	// point (enqueueToSession), so a Telegram/MAX/VK DM shows up live too — not just
-	// UI sends. The nonce rides along so THIS tab skips its own copy (it already
-	// rendered it optimistically) while other tabs render it.
+	// UI sends. The web client does not render a local echo; the server event is the
+	// first visible copy.
+	admission := &sendAdmission{}
 	if !s.d.handleInbound(Inbound{
+		admission:     admission,
 		ChatID:        s.chatID(user),
 		Text:          text,
 		Attachments:   attachments,
 		TargetCreated: targetCreated,
 		Nonce:         nonce,
 		RawMessage:    true, // the UI has no chat commands — "/"-text is a message
+		Origin: inbound.Origin{
+			Transport: "ui",
+			Chat:      inbound.Chat{ID: user, Type: "private"},
+			Message:   inbound.Message{ID: nonce},
+			Sender:    inbound.Sender{ID: user, Username: user},
+		},
 	}) {
+		if admission.err != nil {
+			writeAPIError(w, admission.err)
+			return
+		}
 		// Dropped after our entry checks (drain flipped in the window) — tell the
-		// client so it rolls back the optimistic echo instead of leaving a ghost.
-		http.Error(w, "klax перезапускается — попробуйте через минуту", http.StatusServiceUnavailable)
+		// client so it restores the composer instead of silently losing the draft.
+		http.Error(w, "Сервис перезапускается — попробуйте через минуту", http.StatusServiceUnavailable)
+		return
+	}
+	if returnOn != "queued" {
+		awaitTurn(w, r, admission.completion, returnOn)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -677,57 +1210,130 @@ func (s *uiServer) handleSend(w http.ResponseWriter, r *http.Request) {
 func (s *uiServer) handleAbort(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.auth(r)
 	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	var body struct {
 		Session int64 `json:"session"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
 	if body.Session <= 0 {
-		http.Error(w, "a positive session is required", http.StatusBadRequest)
+		http.Error(w, "A positive session is required", http.StatusBadRequest)
 		return
 	}
 	sk := s.d.sessionKey(s.chatID(user))
 	if s.d.store.Get(sk, body.Session) == nil {
-		http.Error(w, "session not found", http.StatusNotFound)
+		http.Error(w, "Session not found", http.StatusNotFound)
 		return
 	}
 	s.d.abortSession(sk, body.Session, false)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *uiServer) handleSessions(w http.ResponseWriter, r *http.Request) {
+// handleRead persists the durable per-session read-through watermark — the (turn_seq, block index)
+// the client reports as it reads down. The client pushes
+// it PROACTIVELY (on read-settle and on tab-hide), so the read state is durable before the tab can
+// go away and thus survives reload + daemon restart. The watermark only ever RAISES (monotonic),
+// so a stale or out-of-order report can never un-read messages. Persists only when it actually
+// moved. The unread COUNT the badge shows is computed separately (badge-granularity open question).
+func (s *uiServer) handleRead(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.auth(r)
 	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Session int64 `json:"session"`
+		Turn    int64 `json:"turn"`
+		Block   int   `json:"block"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+	if body.Session <= 0 {
+		http.Error(w, "A positive session is required", http.StatusBadRequest)
 		return
 	}
 	sk := s.d.sessionKey(s.chatID(user))
-	s.d.ensureSessionWithCWD(sk, s.d.sessionCWD(s.chatID(user)))
+	if s.d.store.Get(sk, body.Session) == nil {
+		http.Error(w, "Session not found", http.StatusNotFound)
+		return
+	}
+	raised := false
+	s.d.store.UpdateSession(sk, body.Session, func(cur *session.Session) {
+		raised = cur.AdvanceReadThrough(s.readOnly(r), body.Turn, body.Block)
+	})
+	if raised {
+		s.d.saveStore()
+		s.d.broadcastSessions(sk) // push the new read_through/unread to this user's other tabs/devices
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *uiServer) handleSessions(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.auth(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	sk := s.d.sessionKey(s.chatID(user))
+	if !s.readOnly(r) {
+		s.d.ensureSessionWithCWD(sk, s.d.sessionCWD(s.chatID(user)))
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(s.d.sessionsSnapshot(sk))
+	_ = json.NewEncoder(w).Encode(s.d.sessionsSnapshot(sk, s.readOnly(r)))
 }
 
 func (s *uiServer) handleNew(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.auth(r)
 	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Optional initial settings from the "new session" draft dialog: the tab strip
+	// now defers creation until the draft is confirmed, sending the chosen fields
+	// here so the session is born configured. An empty body keeps the old behaviour.
+	var body struct {
+		uiSettingsPatch
+		ControlToken json.RawMessage `json:"control_token"`
+	}
+	if err := decodeAPIRequest(r.Body, &body, true); err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
 	sk := s.d.sessionKey(s.chatID(user))
-	sess := s.d.newUISession(sk, s.chatID(user))
+	// Atomic create: validate + configure the session, then a SINGLE save + broadcast. A rejected
+	// draft (e.g. an inaccessible cwd) creates nothing and returns the real reason; nothing external
+	// ever sees a defaults placeholder, and a crash before the save leaves no half-built session.
+	if len(body.ControlToken) != 0 {
+		writeAPIError(w, &apiError{Code: "unsupported-control-token", Message: "Используйте ui_token или ui_read_token", status: http.StatusBadRequest})
+		return
+	}
+	sess, createErr := s.d.createUISessionAtomic(sk, s.chatID(user), body.uiSettingsPatch)
+	if createErr != nil {
+		status := http.StatusBadRequest
+		if ue, ok := createErr.(*uiErr); ok {
+			status = ue.status
+		}
+		http.Error(w, createErr.Error(), status)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(struct {
 		Created int64 `json:"created"`
@@ -737,11 +1343,11 @@ func (s *uiServer) handleNew(w http.ResponseWriter, r *http.Request) {
 func (s *uiServer) handleRename(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.auth(r)
 	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	var body struct {
@@ -749,43 +1355,71 @@ func (s *uiServer) handleRename(w http.ResponseWriter, r *http.Request) {
 		Name    string `json:"name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
 	if body.Session <= 0 || strings.TrimSpace(body.Name) == "" {
-		http.Error(w, "session and name are required", http.StatusBadRequest)
+		http.Error(w, "Session and name are required", http.StatusBadRequest)
 		return
 	}
 	sk := s.d.sessionKey(s.chatID(user))
-	if !s.d.renameSession(sk, body.Session, body.Name) {
-		http.Error(w, "session not found", http.StatusNotFound)
+	if !s.requireSession(w, sk, body.Session) {
 		return
 	}
+	if !s.d.renameSession(sk, body.Session, body.Name) {
+		http.Error(w, "Session not found", http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *uiServer) handleReorder(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.auth(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Order []int64 `json:"order"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+	sk := s.d.sessionKey(s.chatID(user))
+	s.d.reorderSessions(sk, body.Order)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *uiServer) handleClose(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.auth(r)
 	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	var body struct {
 		Session int64 `json:"session"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
 	if body.Session <= 0 {
-		http.Error(w, "a positive session is required", http.StatusBadRequest)
+		http.Error(w, "A positive session is required", http.StatusBadRequest)
 		return
 	}
 	sk := s.d.sessionKey(s.chatID(user))
+	if !s.requireSession(w, sk, body.Session) {
+		return
+	}
 	if err := s.d.closeSession(sk, body.Session); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -801,7 +1435,7 @@ func (s *uiServer) handleClose(w http.ResponseWriter, r *http.Request) {
 func (s *uiServer) handleTranscript(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.auth(r)
 	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 	created, _ := strconv.ParseInt(r.URL.Query().Get("session"), 10, 64)
@@ -813,19 +1447,28 @@ func (s *uiServer) handleTranscript(w http.ResponseWriter, r *http.Request) {
 	sk := s.d.sessionKey(s.chatID(user))
 	sess := s.d.store.Get(sk, created)
 	if sess == nil {
-		http.Error(w, "session not found", http.StatusNotFound)
+		http.Error(w, "Session not found", http.StatusNotFound)
 		return
 	}
 	backend := sess.Backend
 	if backend == "" {
 		backend = "claude"
 	}
+	// Watermark = hub head BEFORE reading the transcript: every event with seq ≤ watermark
+	// has flushed its content into the transcript (klax flushes before it emits), so the
+	// client resumes its poll cursor here and applies only seq > watermark; any reload-
+	// read/poll overlap is deduped by Block.id.
+	watermark := s.cursorString(s.d.uiHub.head())
+
 	items, err := history.Load(backend, sess.ID, sess.CWD)
 	if err != nil {
 		log.Printf("ui: transcript load: %v", err)
 		items = nil
 	}
-	end := len(items)
+	// Pagination is BY TURN (top-level units), not flat items — a turn with hundreds of
+	// tool blocks is one page unit, so its user message never scrolls off a page top.
+	grouped := groupTurns(items)
+	end := len(grouped)
 	if before > 0 && int(before) < end {
 		end = int(before)
 	}
@@ -833,16 +1476,19 @@ func (s *uiServer) handleTranscript(w http.ResponseWriter, r *http.Request) {
 	if start < 0 {
 		start = 0
 	}
-	turns := items[start:end]
-	if turns == nil {
-		turns = []history.Item{}
-	}
+	queueTurns, _ := s.d.sessionStore(sk, created).InboundLog()
+	presence := transcriptPresence(items, queueTurns)
+	turns := s.d.buildReadModel(sk, created, grouped[start:end], queueTurns, presence, s.d.isSessionBusy(sk, created), start, before == 0, sess.ContextWindow)
+
 	w.Header().Set("Content-Type", "application/json")
+	readTurn, readBlock := sess.ReadThrough(s.readOnly(r))
 	_ = json.NewEncoder(w).Encode(struct {
-		Turns  []history.Item `json:"turns"`
-		More   bool           `json:"more"`
-		Offset int            `json:"offset"`
-	}{Turns: turns, More: start > 0, Offset: start})
+		Turns       []uiTurn `json:"turns"`
+		More        bool     `json:"more"`
+		Offset      int      `json:"offset"`
+		Watermark   string   `json:"watermark"`
+		ReadThrough string   `json:"read_through"` // the tab seeds its unread divider from this
+	}{Turns: turns, More: start > 0, Offset: start, Watermark: watermark, ReadThrough: fmt.Sprintf("%d.%d", readTurn, readBlock)})
 }
 
 // handleEmoji serves a bundled color-emoji web-font subset (woff2). No auth —
@@ -864,8 +1510,18 @@ func (s *uiServer) handleEmoji(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
-// handleSPA serves the single-page app. The real embedded UI replaces this stub.
+// handleSPA serves the single-page app shell at "/" and the SPA's ES modules / stylesheet
+// at "/<name>.js" / "/<name>.css". /api/* and /emoji/ are more-specific routes and never
+// reach here. Any other path 404s (no SPA-deep-link routing — the UI is one page).
 func (s *uiServer) handleSPA(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/manifest.webmanifest" {
+		s.serveManifest(w)
+		return
+	}
+	if p := r.URL.Path; strings.HasSuffix(p, ".js") || strings.HasSuffix(p, ".css") || strings.HasSuffix(p, ".png") {
+		s.serveModule(w, r, p)
+		return
+	}
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
@@ -874,4 +1530,40 @@ func (s *uiServer) handleSPA(w http.ResponseWriter, r *http.Request) {
 	page := bytes.ReplaceAll(spaHTML, []byte("__KLAX_UI_TITLE__"), []byte(html.EscapeString(s.d.cfg.GetUITitle())))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write(page)
+}
+
+func (s *uiServer) serveManifest(w http.ResponseWriter) {
+	title, _ := json.Marshal(s.d.cfg.GetUITitle())
+	data := bytes.ReplaceAll(manifestJSON, []byte("__KLAX_UI_TITLE_JSON__"), title)
+	w.Header().Set("Content-Type", "application/manifest+json")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	_, _ = w.Write(data)
+}
+
+// serveModule serves one SPA ES module / stylesheet from the embedded ui_static dir. The
+// name is constrained to a single path component (no traversal); like the shell and emoji
+// font it needs no auth (the token gate is client-side). JS/CSS revalidate on reload;
+// PNG filenames carry a version that must change whenever their content changes.
+func (s *uiServer) serveModule(w http.ResponseWriter, r *http.Request, p string) {
+	name := strings.TrimPrefix(p, "/")
+	if name == "" || strings.Contains(name, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	data, err := moduleFS.ReadFile("ui_static/" + name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	ct := "text/javascript; charset=utf-8"
+	cacheControl := "no-cache"
+	if strings.HasSuffix(name, ".css") {
+		ct = "text/css; charset=utf-8"
+	} else if strings.HasSuffix(name, ".png") {
+		ct = "image/png"
+		cacheControl = "public, max-age=31536000, immutable"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Cache-Control", cacheControl)
+	_, _ = w.Write(data)
 }

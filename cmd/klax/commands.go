@@ -13,6 +13,7 @@ import (
 	"unicode"
 
 	"github.com/PiDmitrius/klax/internal/config"
+	"github.com/PiDmitrius/klax/internal/pathutil"
 	"github.com/PiDmitrius/klax/internal/session"
 	"github.com/PiDmitrius/klax/internal/tg"
 )
@@ -25,7 +26,7 @@ var tgMenuCommands = []tg.BotCommand{
 	{Command: "abort", Description: "Прервать"},
 }
 
-var transportOrder = []string{"tg", "mx", "vk"}
+var transportOrder = []string{"tg", "mx", "vk", "ym"}
 
 // sessionBusyText is shown when a setting that feeds into RunOptions is
 // changed while the session has work in flight. The current run captured the
@@ -46,6 +47,8 @@ func normalizeCommand(cmd string, args []string) (string, []string) {
 		return "/groups", append([]string{cmd[len("/group_"):]}, args...)
 	case strings.HasPrefix(cmd, "/verbose_") && len(cmd) > len("/verbose_"):
 		return "/verbose", append([]string{cmd[len("/verbose_"):]}, args...)
+	case strings.HasPrefix(cmd, "/attachments_") && len(cmd) > len("/attachments_"):
+		return "/attachments", append([]string{cmd[len("/attachments_"):]}, args...)
 	case strings.HasPrefix(cmd, "/m_") && len(cmd) > len("/m_"):
 		return "/__set_model", []string{cmd[len("/m_"):]}
 	case strings.HasPrefix(cmd, "/t_") && len(cmd) > len("/t_"):
@@ -167,13 +170,16 @@ func (d *daemon) handleBackendSet(chatID, msgID, sk, name string) {
 			def.Think = ""
 		}
 	})
-	sess = d.store.UpdateActive(sk, func(sess *session.Session) {
+	sess = d.store.UpdateSession(sk, sess.Created, func(sess *session.Session) {
 		sess.Backend = name
 		if current != name {
 			sess.ModelOverride = ""
 			sess.ThinkOverride = ""
 		}
 	})
+	if sess == nil {
+		return
+	}
 	d.saveStore()
 	d.sendMessage(chatID, msgID, d.settingsText(chatID, sk, sess))
 }
@@ -192,9 +198,12 @@ func (d *daemon) handleModelSet(chatID, msgID, sk, alias string) {
 		d.store.UpdateScopeDefaults(sk, func(def *session.ScopeDefaults) {
 			def.Model = ""
 		})
-		sess = d.store.UpdateActive(sk, func(sess *session.Session) {
+		sess = d.store.UpdateSession(sk, sess.Created, func(sess *session.Session) {
 			sess.ModelOverride = ""
 		})
+		if sess == nil {
+			return
+		}
 		d.saveStore()
 		d.sendMessage(chatID, msgID, d.settingsText(chatID, sk, sess))
 		return
@@ -211,9 +220,12 @@ func (d *daemon) handleModelSet(chatID, msgID, sk, alias string) {
 	d.store.UpdateScopeDefaults(sk, func(def *session.ScopeDefaults) {
 		def.Model = resolved
 	})
-	sess = d.store.UpdateActive(sk, func(sess *session.Session) {
+	sess = d.store.UpdateSession(sk, sess.Created, func(sess *session.Session) {
 		sess.ModelOverride = resolved
 	})
+	if sess == nil {
+		return
+	}
 	d.saveStore()
 	d.sendMessage(chatID, msgID, d.settingsText(chatID, sk, sess))
 }
@@ -232,9 +244,12 @@ func (d *daemon) handleThinkSet(chatID, msgID, sk, alias string) {
 		d.store.UpdateScopeDefaults(sk, func(def *session.ScopeDefaults) {
 			def.Think = ""
 		})
-		sess = d.store.UpdateActive(sk, func(sess *session.Session) {
+		sess = d.store.UpdateSession(sk, sess.Created, func(sess *session.Session) {
 			sess.ThinkOverride = ""
 		})
+		if sess == nil {
+			return
+		}
 		d.saveStore()
 		d.sendMessage(chatID, msgID, d.settingsText(chatID, sk, sess))
 		return
@@ -251,9 +266,12 @@ func (d *daemon) handleThinkSet(chatID, msgID, sk, alias string) {
 	d.store.UpdateScopeDefaults(sk, func(def *session.ScopeDefaults) {
 		def.Think = resolved
 	})
-	sess = d.store.UpdateActive(sk, func(sess *session.Session) {
+	sess = d.store.UpdateSession(sk, sess.Created, func(sess *session.Session) {
 		sess.ThinkOverride = resolved
 	})
+	if sess == nil {
+		return
+	}
 	d.saveStore()
 	d.sendMessage(chatID, msgID, d.settingsText(chatID, sk, sess))
 }
@@ -275,9 +293,12 @@ func (d *daemon) handleSandboxSet(chatID, msgID, sk, mode string) {
 	d.store.UpdateScopeDefaults(sk, func(def *session.ScopeDefaults) {
 		def.Sandbox = mode
 	})
-	sess = d.store.UpdateActive(sk, func(sess *session.Session) {
+	sess = d.store.UpdateSession(sk, sess.Created, func(sess *session.Session) {
 		sess.Sandbox = mode
 	})
+	if sess == nil {
+		return
+	}
 	d.saveStore()
 	d.sendMessage(chatID, msgID, d.settingsText(chatID, sk, sess))
 }
@@ -304,9 +325,12 @@ func (d *daemon) handleTTYSet(chatID, msgID, sk, mode string) {
 	d.store.UpdateScopeDefaults(sk, func(def *session.ScopeDefaults) {
 		def.ClaudeTTY = on
 	})
-	sess = d.store.UpdateActive(sk, func(sess *session.Session) {
+	sess = d.store.UpdateSession(sk, sess.Created, func(sess *session.Session) {
 		sess.ClaudeTTY = on
 	})
+	if sess == nil {
+		return
+	}
 	d.saveStore()
 	d.sendMessage(chatID, msgID, d.settingsText(chatID, sk, sess))
 }
@@ -328,6 +352,28 @@ func (d *daemon) handleVerboseSet(chatID, msgID, sk, mode string) {
 	d.setGroupVerbose(chatID, mode == "on")
 	if sess == nil {
 		d.sendMessage(chatID, msgID, d.verboseText(chatID))
+		return
+	}
+	d.sendMessage(chatID, msgID, d.settingsText(chatID, sk, sess))
+}
+
+func (d *daemon) handleAttachmentsSet(chatID, msgID, sk, mode string) {
+	if !isGroupChatID(chatID) {
+		d.sendMessage(chatID, msgID, "❌ Команда /attachments работает только в групповых чатах.")
+		return
+	}
+	if !d.isGroupChat(chatID) {
+		d.sendMessage(chatID, msgID, "❌ Сначала включи режим группы: /group_on")
+		return
+	}
+	if mode != "on" && mode != "off" && mode != "any" {
+		d.sendMessage(chatID, msgID, d.attachmentsText(chatID))
+		return
+	}
+	d.setGroupAttachmentMode(chatID, mode)
+	sess := d.store.Active(sk)
+	if sess == nil {
+		d.sendMessage(chatID, msgID, d.attachmentsText(chatID))
 		return
 	}
 	d.sendMessage(chatID, msgID, d.settingsText(chatID, sk, sess))
@@ -369,7 +415,9 @@ func (d *daemon) handleSessionDelete(chatID, msgID, sk, n string) {
 		d.sendMessage(chatID, msgID, "⏳ Сессия занята: дождись завершения или сначала переключись и /abort.")
 		return
 	}
-	d.store.Delete(sk, pos)
+	d.abortSession(sk, target.Created, true)
+	d.store.DeleteCreated(sk, target.Created)
+	d.removeSessionStore(sk, target.Created) // before dropRunner: latch the runner-owned store
 	d.dropRunner(sk, target.Created)
 	d.saveStore()
 	d.sendMessage(chatID, msgID, d.cleanupText(sk))
@@ -387,16 +435,30 @@ func sessionNameArg(args []string) string {
 // createSession resolves the chat's CWD and scope defaults and creates a new
 // active session. Shared by /new and /nuke.
 func (d *daemon) createSession(chatID, sk, name string) (*session.Session, *session.ScopeDefaults) {
+	cwd := d.defaultSessionCWD(chatID, sk)
+	def := d.scopeDefaults(sk)
+	sess := d.store.New(sk, name, cwd, *def)
+	return sess, def
+}
+
+// defaultSessionCWD resolves the working directory a fresh session would inherit
+// (explicit /cwd default → chat cwd → user default → config default → home), so
+// the "new session" draft dialog can preview the same value createSession would use.
+func (d *daemon) defaultSessionCWD(chatID, sk string) string {
+	if cwd := d.scopeDefaults(sk).CWD; cwd != "" {
+		return cwd
+	}
 	cwd := d.sessionCWD(chatID)
+	if cwd == "" {
+		cwd = d.userDefaultCWD(sk)
+	}
 	if cwd == "" {
 		cwd = d.cfg.DefaultCWD
 	}
 	if cwd == "" {
 		cwd, _ = os.UserHomeDir()
 	}
-	def := d.scopeDefaults(sk)
-	sess := d.store.New(sk, name, cwd, *def)
-	return sess, def
+	return cwd
 }
 
 // deleteInactiveSessions aborts and removes every non-active session in the
@@ -417,7 +479,8 @@ func (d *daemon) deleteInactiveSessions(sk string) (deleted, aborted int) {
 		if d.abortSession(sk, s.Created, true) {
 			aborted++
 		}
-		if d.store.Delete(sk, i) {
+		if d.store.DeleteCreated(sk, s.Created) {
+			d.removeSessionStore(sk, s.Created) // before dropRunner: latch the runner-owned store
 			d.dropRunner(sk, s.Created)
 			deleted++
 		}
@@ -435,27 +498,7 @@ func argPayload(text string) string {
 	return strings.TrimLeftFunc(text[i:], unicode.IsSpace)
 }
 
-// expandBypassUnderscore rewrites "/bypass_X ..." to "/bypass X ..." so the
-// payload is recoverable via argPayload/args. normalizeCommand can't help
-// here because /bypass uses the raw text, not split args.
-func expandBypassUnderscore(text string) string {
-	i := strings.IndexFunc(text, unicode.IsSpace)
-	first, rest := text, ""
-	if i >= 0 {
-		first, rest = text[:i], text[i:]
-	}
-	bare := first
-	if at := strings.Index(bare, "@"); at != -1 {
-		bare = bare[:at]
-	}
-	if low := strings.ToLower(bare); strings.HasPrefix(low, "/bypass_") && len(bare) > len("/bypass_") {
-		return "/bypass " + bare[len("/bypass_"):] + rest
-	}
-	return text
-}
-
 func (d *daemon) handleCommand(chatID, msgID, text string) {
-	text = expandBypassUnderscore(text)
 	parts := strings.Fields(text)
 	cmd := strings.ToLower(parts[0])
 	// Strip @botname suffix (e.g. /sessions@klax_bot → /sessions)
@@ -519,7 +562,12 @@ func (d *daemon) handleCommand(chatID, msgID, text string) {
 			d.sendMessage(chatID, msgID, "Использование: /name <имя>")
 			return
 		}
-		sess := d.store.UpdateActive(sk, func(sess *session.Session) {
+		sess := d.store.Active(sk)
+		if sess == nil {
+			d.sendMessage(chatID, msgID, "Нет активной сессии")
+			return
+		}
+		sess = d.store.UpdateSession(sk, sess.Created, func(sess *session.Session) {
 			sess.Name = strings.Join(args, " ")
 		})
 		if sess == nil {
@@ -533,7 +581,7 @@ func (d *daemon) handleCommand(chatID, msgID, text string) {
 		if len(args) == 0 {
 			sess := d.store.Active(sk)
 			if sess != nil {
-				d.sendMessage(chatID, msgID, fmt.Sprintf("📂 <code>%s</code>", html.EscapeString(tildePath(sess.CWD))))
+				d.sendMessage(chatID, msgID, fmt.Sprintf("📂 <code>%s</code>", html.EscapeString(pathutil.TildePathsInText(sess.CWD))))
 			}
 			return
 		}
@@ -542,19 +590,28 @@ func (d *daemon) handleCommand(chatID, msgID, text string) {
 			d.sendMessage(chatID, msgID, "Нет активной сессии")
 			return
 		}
+		if active.Messages > 0 {
+			d.sendMessage(chatID, msgID, "Рабочую директорию нельзя изменить после первого сообщения.")
+			return
+		}
 		if d.isSessionBusy(sk, active.Created) {
 			d.sendMessage(chatID, msgID, sessionBusyText)
 			return
 		}
-		sess := d.store.UpdateActive(sk, func(sess *session.Session) {
-			sess.CWD = strings.Join(args, " ")
-		})
-		if sess == nil {
-			d.sendMessage(chatID, msgID, "Нет активной сессии")
+		cwd, err := resolveWorkingDir(strings.Join(args, " "))
+		if err != nil {
+			d.sendMessage(chatID, msgID, fmt.Sprintf("❌ %s", html.EscapeString(err.Error())))
+			return
+		}
+		// Re-check Messages==0 atomically with the write: a message could have started
+		// and finished running between the snapshot check above and this call.
+		sess, ok := d.store.SetCWDIfMessages0(sk, active.Created, cwd)
+		if !ok {
+			d.sendMessage(chatID, msgID, "Рабочую директорию нельзя изменить после первого сообщения.")
 			return
 		}
 		d.saveStore()
-		d.sendMessage(chatID, msgID, fmt.Sprintf("📂 <code>%s</code>", html.EscapeString(tildePath(sess.CWD))))
+		d.sendMessage(chatID, msgID, fmt.Sprintf("📂 <code>%s</code>", html.EscapeString(pathutil.TildePathsInText(sess.CWD))))
 
 	case "/prompt":
 		sess := d.store.Active(sk)
@@ -574,9 +631,12 @@ func (d *daemon) handleCommand(chatID, msgID, text string) {
 			d.sendMessage(chatID, msgID, sessionBusyText)
 			return
 		}
-		sess = d.store.UpdateActive(sk, func(sess *session.Session) {
+		sess = d.store.UpdateSession(sk, sess.Created, func(sess *session.Session) {
 			sess.AppendSystemPrompt = argPayload(text)
 		})
+		if sess == nil {
+			return
+		}
 		d.saveStore()
 		d.sendMessage(chatID, msgID, fmt.Sprintf("📝 <code>%s</code>", html.EscapeString(sess.AppendSystemPrompt)))
 
@@ -622,6 +682,13 @@ func (d *daemon) handleCommand(chatID, msgID, text string) {
 		}
 		d.handleVerboseSet(chatID, msgID, sk, mode)
 
+	case "/attachments":
+		mode := ""
+		if len(args) > 0 {
+			mode = strings.ToLower(args[0])
+		}
+		d.handleAttachmentsSet(chatID, msgID, sk, mode)
+
 	case "/settings", "/setting":
 		sess := d.store.Active(sk)
 		if sess == nil {
@@ -658,14 +725,6 @@ func (d *daemon) handleCommand(chatID, msgID, text string) {
 
 	case "/usage":
 		d.handleUsage(chatID, msgID, sk)
-
-	case "/bypass":
-		if len(parts) < 2 {
-			d.sendMessage(chatID, msgID, "Использование: /bypass <команда>")
-			return
-		}
-		prompt := argPayload(text)
-		d.enqueue(chatID, msgID, prompt)
 
 	case "/abort":
 		// /abort targets the currently active session — that is the one the
@@ -718,25 +777,21 @@ func (d *daemon) handleGroups(chatID, msgID string, parts []string) {
 			d.sendMessage(chatID, msgID, "❌ Команда /groups on работает только в групповых чатах.")
 			return
 		}
-		cwd := d.sessionCWD(chatID)
+		sk := d.sessionKey(chatID)
+		cwd := d.defaultSessionCWD(chatID, sk)
 		if cwd == "" {
 			d.sendMessage(chatID, msgID, "❌ Не удалось определить директорию группы.")
 			return
 		}
 		d.enableGroupChat(chatID, cwd)
-		// Create a fresh session for group mode with the correct CWD.
-		// Any pre-existing sessions (from before group mode) are left inactive.
-		sk := d.sessionKey(chatID)
-		sessions := d.store.SessionsFor(sk)
-		// Check if there's already a session with group CWD.
-		hasGroupSession := false
-		for _, s := range sessions {
-			if s.CWD == cwd {
-				hasGroupSession = true
-				break
-			}
-		}
-		if !hasGroupSession {
+		// Create a fresh session for group mode with the correct CWD, unless the
+		// CURRENTLY ACTIVE session already has it — checking any historical (now
+		// inactive) session here would leave an unrelated active session in place
+		// while the group registry points elsewhere, a divergence nothing would
+		// ever reconcile afterward (Store no longer re-derives an active session's
+		// CWD on its own).
+		active := d.store.Active(sk)
+		if active == nil || active.CWD != cwd {
 			d.store.New(sk, "group", cwd, *d.scopeDefaults(sk))
 		}
 		d.saveStore()
@@ -786,7 +841,7 @@ func (d *daemon) groupsText() string {
 		if enabled, ok := d.groupVerb[id]; ok && !enabled {
 			verbose = "off"
 		}
-		sb.WriteString(fmt.Sprintf("- <code>%s</code>\n  📂 <code>%s</code>\n  🗣 verbose: <code>%s</code>\n", html.EscapeString(id), html.EscapeString(tildePath(d.groupChats[id])), verbose))
+		sb.WriteString(fmt.Sprintf("- <code>%s</code>\n  📂 <code>%s</code>\n  🗣 verbose: <code>%s</code>\n", html.EscapeString(id), html.EscapeString(pathutil.TildePathsInText(d.groupChats[id])), verbose))
 	}
 	return sb.String()
 }
@@ -809,6 +864,8 @@ func (d *daemon) handleTransports(chatID, msgID string, parts []string) {
 			name = "mx"
 		case "telegram":
 			name = "tg"
+		case "yandex":
+			name = "ym"
 		}
 
 		// The web UI is a transport for reply delivery but not a pollable
@@ -831,7 +888,7 @@ func (d *daemon) handleTransports(chatID, msgID string, parts []string) {
 			delete(d.disabled, name)
 			d.mu.Unlock()
 			d.saveDisabled()
-			d.startPoll(name)
+			d.connect(name) // revalidate: the transport may never have passed its handshake
 			d.sendPlain(chatID, msgID, d.transportsText())
 		case "off":
 			if name == current {
@@ -845,7 +902,7 @@ func (d *daemon) handleTransports(chatID, msgID string, parts []string) {
 			d.saveDisabled()
 			d.sendPlain(chatID, msgID, d.transportsText())
 		default:
-			d.sendMessage(chatID, msgID, "Использование: /transports [on|off <tg|max|vk>]")
+			d.sendMessage(chatID, msgID, "Использование: /transports [on|off <tg|max|vk|ym>]")
 		}
 		return
 	}

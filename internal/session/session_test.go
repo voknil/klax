@@ -1,8 +1,10 @@
 package session
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -12,14 +14,14 @@ func TestLoadStoreMigratesLegacyEffortOverrideAndScopeDefaults(t *testing.T) {
 
 	data := `{
   "chats": {
-    "user:claw": {
+    "user:alice": {
       "sessions": [
         {
           "name": "main",
           "cwd": "/tmp/project",
           "active": true,
           "backend": "codex",
-          "model_override": "gpt-5.4",
+          "model_override": "gpt-5.6-sol",
           "effort_override": "high",
           "messages": 1
         }
@@ -36,7 +38,7 @@ func TestLoadStoreMigratesLegacyEffortOverrideAndScopeDefaults(t *testing.T) {
 		t.Fatalf("LoadStore: %v", err)
 	}
 
-	sess := store.Active("user:claw")
+	sess := store.Active("user:alice")
 	if sess == nil {
 		t.Fatal("expected active session")
 	}
@@ -44,7 +46,7 @@ func TestLoadStoreMigratesLegacyEffortOverrideAndScopeDefaults(t *testing.T) {
 		t.Fatalf("ThinkOverride = %q, want high", sess.ThinkOverride)
 	}
 
-	def := store.ScopeDefaults("user:claw")
+	def := store.ScopeDefaults("user:alice")
 	if def == nil {
 		t.Fatal("expected scope defaults")
 	}
@@ -65,7 +67,7 @@ func TestLoadStorePinsLegacyUsedSessionsToClaude(t *testing.T) {
 
 	data := `{
   "chats": {
-    "user:claw": {
+    "user:alice": {
       "sessions": [
         {
           "name": "legacy-used",
@@ -77,7 +79,7 @@ func TestLoadStorePinsLegacyUsedSessionsToClaude(t *testing.T) {
     }
   },
   "scope_defaults": {
-    "user:claw": {
+    "user:alice": {
       "backend": "codex"
     }
   }
@@ -91,7 +93,7 @@ func TestLoadStorePinsLegacyUsedSessionsToClaude(t *testing.T) {
 		t.Fatalf("LoadStore: %v", err)
 	}
 
-	sess := store.Active("user:claw")
+	sess := store.Active("user:alice")
 	if sess == nil {
 		t.Fatal("expected active session")
 	}
@@ -133,30 +135,91 @@ func TestLoadStoreSupportsLegacyFlatFormat(t *testing.T) {
 	}
 }
 
+// TestReadThroughWatermarkRoundTrips locks the durable unread cursor: it loads from a store,
+// defaults to the zero watermark on a legacy store that omits the
+// fields, and survives a Save→reload — including a 0 block index under `omitempty`.
+func TestReadThroughWatermarkRoundTrips(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("KLAX_DATA_DIR", tmp)
+
+	// First session carries a watermark; the second (legacy) omits the fields entirely.
+	data := `{
+  "chats": {
+    "user:alice": {
+      "sessions": [
+        {"name": "with-mark", "cwd": "/tmp/p", "active": true, "created": 1000, "messages": 2,
+         "read_through_turn": 5, "read_through_block": 3},
+        {"name": "legacy", "cwd": "/tmp/p", "created": 2000, "messages": 0}
+      ]
+    }
+  }
+}`
+	if err := os.WriteFile(filepath.Join(tmp, "sessions.json"), []byte(data), 0600); err != nil {
+		t.Fatalf("write sessions.json: %v", err)
+	}
+
+	store, err := LoadStore()
+	if err != nil {
+		t.Fatalf("LoadStore: %v", err)
+	}
+	sessions := store.SessionsFor("user:alice")
+	if len(sessions) != 2 {
+		t.Fatalf("len(sessions) = %d, want 2", len(sessions))
+	}
+	if sessions[0].ReadThroughTurn != 5 || sessions[0].ReadThroughBlock != 3 {
+		t.Fatalf("loaded watermark = (%d,%d), want (5,3)", sessions[0].ReadThroughTurn, sessions[0].ReadThroughBlock)
+	}
+	// Backward compat: a store predating the fields loads as the zero watermark ("nothing read").
+	if sessions[1].ReadThroughTurn != 0 || sessions[1].ReadThroughBlock != 0 {
+		t.Fatalf("legacy watermark = (%d,%d), want (0,0)", sessions[1].ReadThroughTurn, sessions[1].ReadThroughBlock)
+	}
+
+	// Serialization round-trip: raise the watermark, persist, reload — it survives, and a 0 block
+	// index (dropped by omitempty) still reloads as 0 rather than corrupting the turn.
+	store.UpdateSession("user:alice", 1000, func(cur *Session) {
+		cur.ReadThroughTurn = 9
+		cur.ReadThroughBlock = 0
+	})
+	if err := store.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	reloaded, err := LoadStore()
+	if err != nil {
+		t.Fatalf("LoadStore (reload): %v", err)
+	}
+	got := reloaded.Get("user:alice", 1000)
+	if got == nil {
+		t.Fatal("expected session created=1000 after reload")
+	}
+	if got.ReadThroughTurn != 9 || got.ReadThroughBlock != 0 {
+		t.Fatalf("round-tripped watermark = (%d,%d), want (9,0)", got.ReadThroughTurn, got.ReadThroughBlock)
+	}
+}
+
 func TestNewSnapshotsScopeDefaults(t *testing.T) {
 	store := &Store{
 		Chats: make(map[string]*ChatSessions),
 		Scope: make(map[string]*ScopeDefaults),
 	}
 
-	def := store.EnsureScopeDefaults("user:claw", ScopeDefaults{Backend: "claude"})
+	def := store.EnsureScopeDefaults("user:alice", ScopeDefaults{Backend: "claude"})
 	if def.Backend != "claude" {
 		t.Fatalf("defaults backend = %q, want claude", def.Backend)
 	}
-	store.UpdateScopeDefaults("user:claw", func(def *ScopeDefaults) {
+	store.UpdateScopeDefaults("user:alice", func(def *ScopeDefaults) {
 		def.Backend = "codex"
-		def.Model = "gpt-5.4"
+		def.Model = "gpt-5.6-sol"
 		def.Think = "high"
 		def.Sandbox = "on"
 		def.ClaudeTTY = true
 	})
 
-	sess := store.New("user:claw", "main", "/tmp/project", *store.ScopeDefaults("user:claw"))
+	sess := store.New("user:alice", "main", "/tmp/project", *store.ScopeDefaults("user:alice"))
 	if sess.Backend != "codex" {
 		t.Fatalf("backend = %q, want codex", sess.Backend)
 	}
-	if sess.ModelOverride != "gpt-5.4" {
-		t.Fatalf("model = %q, want gpt-5.4", sess.ModelOverride)
+	if sess.ModelOverride != "gpt-5.6-sol" {
+		t.Fatalf("model = %q, want gpt-5.6-sol", sess.ModelOverride)
 	}
 	if sess.ThinkOverride != "high" {
 		t.Fatalf("think = %q, want high", sess.ThinkOverride)
@@ -168,7 +231,7 @@ func TestNewSnapshotsScopeDefaults(t *testing.T) {
 		t.Fatal("claude tty default was not copied to new session")
 	}
 
-	store.UpdateScopeDefaults("user:claw", func(def *ScopeDefaults) {
+	store.UpdateScopeDefaults("user:alice", func(def *ScopeDefaults) {
 		def.Backend = "claude"
 		def.Model = "sonnet"
 		def.Think = "medium"
@@ -176,14 +239,14 @@ func TestNewSnapshotsScopeDefaults(t *testing.T) {
 		def.ClaudeTTY = false
 	})
 
-	sess = store.Active("user:claw")
+	sess = store.Active("user:alice")
 	if sess == nil {
 		t.Fatal("expected active session")
 	}
 	if sess.Backend != "codex" {
 		t.Fatalf("snapshot backend changed to %q", sess.Backend)
 	}
-	if sess.ModelOverride != "gpt-5.4" {
+	if sess.ModelOverride != "gpt-5.6-sol" {
 		t.Fatalf("snapshot model changed to %q", sess.ModelOverride)
 	}
 	if sess.ThinkOverride != "high" {
@@ -207,7 +270,7 @@ func TestNewAssignsUniqueCreatedAcrossRapidCalls(t *testing.T) {
 	const n = 5
 	seen := make(map[int64]bool, n)
 	for i := 0; i < n; i++ {
-		sess := store.New("user:claw", "s", "/tmp", defaults)
+		sess := store.New("user:alice", "s", "/tmp", defaults)
 		if seen[sess.Created] {
 			t.Fatalf("duplicate Created %d on iteration %d", sess.Created, i)
 		}
@@ -215,14 +278,296 @@ func TestNewAssignsUniqueCreatedAcrossRapidCalls(t *testing.T) {
 	}
 }
 
+// The session key is a store-global monotonic counter that is NEVER reused after a delete (reuse would
+// bind a new session to a deleted one's removed durable Store), and the high-water survives a
+// save/reload. Invariant: 1, 2, delete → 3 (not 2).
+func TestCreatedNeverReusedAfterDelete(t *testing.T) {
+	t.Setenv("KLAX_DATA_DIR", t.TempDir())
+	store, err := LoadStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := store.New("user:alice", "a", "/tmp", ScopeDefaults{})
+	b := store.New("user:alice", "b", "/tmp", ScopeDefaults{})
+	if a.Created != 1 || b.Created != 2 {
+		t.Fatalf("keys must count 1,2, got a=%d b=%d", a.Created, b.Created)
+	}
+	// Delete the highest (b) — the high-water must NOT drop, so the next key is 3, not a reused 2.
+	if !store.Delete("user:alice", 1) {
+		t.Fatal("delete failed")
+	}
+	c := store.New("user:alice", "c", "/tmp", ScopeDefaults{})
+	if c.Created != 3 {
+		t.Fatalf("key reused after delete: want 3, got %d", c.Created)
+	}
+	// The high-water survives a save + reload.
+	if err := store.Save(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := LoadStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := reloaded.New("user:alice", "d", "/tmp", ScopeDefaults{}); d.Created != 4 {
+		t.Fatalf("high-water not persisted across reload: want 4, got %d", d.Created)
+	}
+}
+
+func TestSessionKeysStayUniqueAcrossMerge(t *testing.T) {
+	store := &Store{
+		Chats: make(map[string]*ChatSessions),
+		Scope: make(map[string]*ScopeDefaults),
+	}
+	a := store.New("tg:1", "telegram", "/tmp", ScopeDefaults{})
+	b := store.New("mx:1", "max", "/tmp", ScopeDefaults{})
+	c := store.New("user:alice", "canonical", "/tmp", ScopeDefaults{})
+	if a.Created != 1 || b.Created != 2 || c.Created != 3 {
+		t.Fatalf("keys must be global 1,2,3; got %d,%d,%d", a.Created, b.Created, c.Created)
+	}
+	if !store.MergeKeys("user:alice", []string{"tg:1", "mx:1"}) {
+		t.Fatal("MergeKeys returned false")
+	}
+	seen := map[int64]bool{}
+	for _, sess := range store.SessionsFor("user:alice") {
+		if seen[sess.Created] {
+			t.Fatalf("duplicate key %d after merge", sess.Created)
+		}
+		seen[sess.Created] = true
+	}
+	if next := store.New("user:alice", "next", "/tmp", ScopeDefaults{}); next.Created != 4 {
+		t.Fatalf("next key after merge = %d, want 4", next.Created)
+	}
+}
+
+func TestLoadMigratesPerChatHighWaterToGlobal(t *testing.T) {
+	t.Setenv("KLAX_DATA_DIR", t.TempDir())
+	path := filepath.Join(StoreDir(), "sessions.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	data := `{"chats":{"user:alice":{"high_water":9,"sessions":[]},"tg:2":{"high_water":12,"sessions":[]}}}`
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := LoadStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.New("user:alice", "next", "/tmp", ScopeDefaults{}).Created; got != 13 {
+		t.Fatalf("key after per-chat high-water migration = %d, want 13", got)
+	}
+	if err := store.Save(); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(saved), `"high_water"`) != 1 {
+		t.Fatalf("saved store must contain only the global high-water: %s", saved)
+	}
+}
+
+func TestAddInsertsFullyFormedSessionActivating(t *testing.T) {
+	store := &Store{
+		Chats: make(map[string]*ChatSessions),
+		Scope: make(map[string]*ScopeDefaults),
+	}
+	first := store.New("user:alice", "one", "/tmp", ScopeDefaults{Backend: "claude"})
+	// Add a fully-formed session in one atomic op; it must become active and deactivate the previous.
+	added := store.Add("user:alice", &Session{Name: "two", Backend: "codex", ModelOverride: "m", CWD: "/w"})
+	if added.Created == 0 || added.Created <= first.Created {
+		t.Fatalf("Add must assign a unique increasing Created: %d vs %d", added.Created, first.Created)
+	}
+	if !added.Active {
+		t.Fatal("added session must be active")
+	}
+	if added.Name != "two" || added.Backend != "codex" || added.ModelOverride != "m" || added.CWD != "/w" {
+		t.Fatalf("added session lost its formed config: %+v", added)
+	}
+	sessions := store.SessionsFor("user:alice")
+	if len(sessions) != 2 {
+		t.Fatalf("want 2 sessions, got %d", len(sessions))
+	}
+	active := 0
+	for _, s := range sessions {
+		if s.Active {
+			active++
+		}
+	}
+	if active != 1 {
+		t.Fatalf("exactly one session must be active after Add, got %d", active)
+	}
+	if store.Active("user:alice").Created != added.Created {
+		t.Fatal("the added session must be the active one")
+	}
+}
+
+func TestAddWithDefaultsCommitsSessionAndTemplateTogether(t *testing.T) {
+	store := &Store{Chats: map[string]*ChatSessions{}, Scope: map[string]*ScopeDefaults{}}
+	def := &ScopeDefaults{Backend: "codex", Model: "m", Think: "high", Sandbox: "on"}
+	added := store.AddWithDefaults("user:alice", &Session{Name: "new", CWD: "/tmp", Backend: "codex"}, def)
+	if added == nil || added.Created == 0 {
+		t.Fatalf("session was not added: %+v", added)
+	}
+	got := store.ScopeDefaults("user:alice")
+	if got == nil || *got != *def {
+		t.Fatalf("defaults = %+v, want %+v", got, def)
+	}
+}
+
+func TestScopeDefaultsReturnsIndependentGroupState(t *testing.T) {
+	enabled, verbose, legacyAttachments := true, false, true
+	store := &Store{Chats: map[string]*ChatSessions{}, Scope: map[string]*ScopeDefaults{}}
+	store.UpdateScopeDefaults("ym:group#thread", func(def *ScopeDefaults) {
+		def.GroupMode = &enabled
+		def.GroupVerbose = &verbose
+		def.GroupAttachmentMode = "any"
+		def.LegacyGroupAttachments = &legacyAttachments
+	})
+
+	got := store.ScopeDefaults("ym:group#thread")
+	if got.GroupMode == nil || got.GroupVerbose == nil || got.LegacyGroupAttachments == nil || got.GroupAttachmentMode != "any" {
+		t.Fatalf("group state missing from clone: %+v", got)
+	}
+	*got.GroupMode = false
+	*got.GroupVerbose = true
+	*got.LegacyGroupAttachments = false
+
+	again := store.ScopeDefaults("ym:group#thread")
+	if !*again.GroupMode || *again.GroupVerbose || !*again.LegacyGroupAttachments || again.GroupAttachmentMode != "any" {
+		t.Fatalf("mutating a clone changed stored defaults: %+v", again)
+	}
+}
+
+func TestReorderRearrangesAndToleratesPartialOrder(t *testing.T) {
+	store := &Store{
+		Chats: make(map[string]*ChatSessions),
+		Scope: make(map[string]*ScopeDefaults),
+	}
+	var ids []int64
+	for i := 0; i < 4; i++ {
+		ids = append(ids, store.New("user:alice", "s", "/tmp", ScopeDefaults{Backend: "claude"}).Created)
+	}
+	// ids is [a,b,c,d] in creation order. A filtered (group) strip showing only c and d drags them
+	// into the order [d,c]: the SLOTS they occupied (2 and 3) are refilled, and a/b never move.
+	if !store.Reorder("user:alice", []int64{ids[3], ids[2]}) {
+		t.Fatal("Reorder returned false for a real change")
+	}
+	got := store.SessionsFor("user:alice")
+	want := []int64{ids[0], ids[1], ids[3], ids[2]}
+	for i, w := range want {
+		if got[i].Created != w {
+			t.Fatalf("Reorder order[%d]=%d, want %d (full: %v)", i, got[i].Created, w, createds(got))
+		}
+	}
+	// An unknown id is ignored and a no-op order changes nothing.
+	if store.Reorder("user:alice", []int64{99999}) {
+		t.Fatal("Reorder must be a no-op (false) when nothing moves")
+	}
+	if got2 := store.SessionsFor("user:alice"); createds(got2)[0] != ids[0] {
+		t.Fatalf("no-op Reorder disturbed the order: %v", createds(got2))
+	}
+	// A FULL list is the same operation with every slot occupied: the result is exactly the request,
+	// so the unfiltered root strip keeps behaving as it always did.
+	if !store.Reorder("user:alice", []int64{ids[2], ids[0], ids[3], ids[1]}) {
+		t.Fatal("Reorder returned false for a real full-list change")
+	}
+	if got3 := createds(store.SessionsFor("user:alice")); got3[0] != ids[2] || got3[1] != ids[0] || got3[2] != ids[3] || got3[3] != ids[1] {
+		t.Fatalf("full-list Reorder did not apply verbatim: %v", got3)
+	}
+}
+
+// A group drag must not disturb a DIFFERENT group whose members it does not share — the guarantee
+// that lets one global order serve every filtered view.
+func TestReorderWithinOneGroupLeavesDisjointGroupUntouched(t *testing.T) {
+	store := &Store{
+		Chats: make(map[string]*ChatSessions),
+		Scope: make(map[string]*ScopeDefaults),
+	}
+	var ids []int64
+	for i := 0; i < 4; i++ {
+		ids = append(ids, store.New("user:alice", "s", "/tmp", ScopeDefaults{Backend: "claude"}).Created)
+	}
+	// Interleaved membership: x = {a, c}, y = {b, d}.
+	store.Reorder("user:alice", []int64{ids[2], ids[0]}) // drag inside x: c before a
+	got := createds(store.SessionsFor("user:alice"))
+	want := []int64{ids[2], ids[1], ids[0], ids[3]}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("slot-preserving order = %v, want %v", got, want)
+		}
+	}
+	// y's members kept both their absolute positions and their relative order.
+	if got[1] != ids[1] || got[3] != ids[3] {
+		t.Fatalf("a disjoint group's members moved: %v", got)
+	}
+}
+
+func TestNormalizeGroups(t *testing.T) {
+	got, err := NormalizeGroups([]string{" work ", "work", "", "дом"})
+	if err != nil {
+		t.Fatalf("NormalizeGroups: %v", err)
+	}
+	if len(got) != 2 || got[0] != "work" || got[1] != "дом" {
+		t.Fatalf("NormalizeGroups = %v, want [work дом]", got)
+	}
+	if got, err := NormalizeGroups([]string{"  "}); err != nil || got != nil {
+		t.Fatalf("blank-only groups = %v, %v; want nil, nil", got, err)
+	}
+	// The rejections that keep `#<group>` unambiguous against `#<created>` and `#is:unread`, plus
+	// the root pseudo-group and the two bounds.
+	bad := []string{"123", "is:unread", "a/b", "a#b", "*", "a\u0000b", strings.Repeat("x", MaxGroupLen+1)}
+	for _, name := range bad {
+		if _, err := NormalizeGroups([]string{name}); err == nil {
+			t.Fatalf("NormalizeGroups(%q) accepted an unusable name", name)
+		}
+	}
+	many := make([]string, 0, MaxGroupCount+1)
+	for i := 0; i <= MaxGroupCount; i++ {
+		many = append(many, "g"+string(rune('a'+i)))
+	}
+	if _, err := NormalizeGroups(many); err == nil {
+		t.Fatalf("NormalizeGroups accepted %d groups on one session", len(many))
+	}
+	// A name at the limit is fine — the bound is inclusive.
+	if _, err := NormalizeGroups([]string{strings.Repeat("x", MaxGroupLen)}); err != nil {
+		t.Fatalf("NormalizeGroups rejected a name of exactly MaxGroupLen: %v", err)
+	}
+}
+
+// A returned session must not share its group slice with the store, or a caller's append/edit would
+// silently mutate stored state.
+func TestGetReturnsDetachedGroups(t *testing.T) {
+	store := &Store{
+		Chats: make(map[string]*ChatSessions),
+		Scope: make(map[string]*ScopeDefaults),
+	}
+	c := store.New("user:alice", "s", "/tmp", ScopeDefaults{}).Created
+	store.UpdateSession("user:alice", c, func(cur *Session) { cur.Groups = []string{"work"} })
+	got := store.Get("user:alice", c)
+	got.Groups[0] = "hacked"
+	if again := store.Get("user:alice", c); again.Groups[0] != "work" {
+		t.Fatalf("stored groups were mutated through a returned copy: %v", again.Groups)
+	}
+}
+
+func createds(ss []*Session) []int64 {
+	out := make([]int64, len(ss))
+	for i, s := range ss {
+		out[i] = s.Created
+	}
+	return out
+}
+
 func TestGetReturnsCloneByCreated(t *testing.T) {
 	store := &Store{
 		Chats: make(map[string]*ChatSessions),
 		Scope: make(map[string]*ScopeDefaults),
 	}
-	sess := store.New("user:claw", "main", "/tmp", ScopeDefaults{Backend: "claude"})
+	sess := store.New("user:alice", "main", "/tmp", ScopeDefaults{Backend: "claude"})
 
-	got := store.Get("user:claw", sess.Created)
+	got := store.Get("user:alice", sess.Created)
 	if got == nil {
 		t.Fatal("Get returned nil for existing session")
 	}
@@ -231,12 +576,12 @@ func TestGetReturnsCloneByCreated(t *testing.T) {
 	}
 
 	got.Name = "mutated"
-	again := store.Get("user:claw", sess.Created)
+	again := store.Get("user:alice", sess.Created)
 	if again.Name != "main" {
 		t.Fatalf("Get must return a clone, got mutation leak: %q", again.Name)
 	}
 
-	if store.Get("user:claw", sess.Created+999) != nil {
+	if store.Get("user:alice", sess.Created+999) != nil {
 		t.Fatal("Get must return nil for unknown Created")
 	}
 }
@@ -247,14 +592,14 @@ func TestLoadStoreKeepsEmptyScopeDefaultsAsExplicitDefault(t *testing.T) {
 
 	data := `{
   "chats": {
-    "user:claw": {
+    "user:alice": {
       "sessions": [
         {
           "name": "main",
           "cwd": "/tmp/project",
           "active": true,
           "backend": "codex",
-          "model_override": "gpt-5.4-mini",
+          "model_override": "gpt-5.5",
           "think_override": "high",
           "messages": 1
         }
@@ -262,7 +607,7 @@ func TestLoadStoreKeepsEmptyScopeDefaultsAsExplicitDefault(t *testing.T) {
     }
   },
   "scope_defaults": {
-    "user:claw": {
+    "user:alice": {
       "backend": "codex",
       "model": "",
       "think": ""
@@ -278,7 +623,7 @@ func TestLoadStoreKeepsEmptyScopeDefaultsAsExplicitDefault(t *testing.T) {
 		t.Fatalf("LoadStore: %v", err)
 	}
 
-	def := store.ScopeDefaults("user:claw")
+	def := store.ScopeDefaults("user:alice")
 	if def == nil {
 		t.Fatal("expected scope defaults")
 	}
@@ -287,5 +632,82 @@ func TestLoadStoreKeepsEmptyScopeDefaultsAsExplicitDefault(t *testing.T) {
 	}
 	if def.Think != "" {
 		t.Fatalf("defaults think = %q, want explicit empty default", def.Think)
+	}
+}
+
+func TestSetCWDIfMessages0RejectsWhenMessagesAlreadyStarted(t *testing.T) {
+	store := &Store{Chats: map[string]*ChatSessions{}, Scope: map[string]*ScopeDefaults{}}
+	sess := store.New("tg:1", "one", "/original", ScopeDefaults{})
+	store.UpdateActive("tg:1", func(s *Session) { s.Messages = 1 })
+
+	got, ok := store.SetCWDIfMessages0("tg:1", sess.Created, "/new")
+
+	if ok {
+		t.Fatal("SetCWDIfMessages0 must refuse once Messages > 0")
+	}
+	if got == nil || got.CWD != "/original" {
+		t.Fatalf("session CWD = %+v, want unchanged /original", got)
+	}
+	if store.ScopeDefaults("tg:1").CWD == "/new" {
+		t.Fatal("ScopeDefaults.CWD must not change when the session-level write was refused")
+	}
+}
+
+func TestSetCWDIfMessages0SetsSessionAndScopeDefaultsTogether(t *testing.T) {
+	store := &Store{Chats: map[string]*ChatSessions{}, Scope: map[string]*ScopeDefaults{}}
+	sess := store.New("tg:1", "one", "/original", ScopeDefaults{})
+
+	got, ok := store.SetCWDIfMessages0("tg:1", sess.Created, "/new")
+
+	if !ok || got.CWD != "/new" {
+		t.Fatalf("SetCWDIfMessages0 = %+v, %v, want CWD=/new, true", got, ok)
+	}
+	if store.ScopeDefaults("tg:1").CWD != "/new" {
+		t.Fatal("ScopeDefaults.CWD must be set together with the session's CWD")
+	}
+}
+
+func TestUpdateSessionCheckedSkipsMutationWhenCheckFails(t *testing.T) {
+	store := &Store{Chats: map[string]*ChatSessions{}, Scope: map[string]*ScopeDefaults{}}
+	sess := store.New("tg:1", "one", "/original", ScopeDefaults{})
+	refuse := errors.New("refused")
+
+	got, err := store.UpdateSessionChecked(
+		"tg:1", sess.Created,
+		func(*Session) error { return refuse },
+		func(s *Session) { s.CWD = "/new" },
+	)
+
+	if err != refuse {
+		t.Fatalf("err = %v, want the check's error", err)
+	}
+	if got == nil || got.CWD != "/original" {
+		t.Fatalf("session = %+v, want unchanged /original (mutation must not run when check fails)", got)
+	}
+}
+
+func TestUpdateSessionCheckedAppliesMutationWhenCheckPasses(t *testing.T) {
+	store := &Store{Chats: map[string]*ChatSessions{}, Scope: map[string]*ScopeDefaults{}}
+	sess := store.New("tg:1", "one", "/original", ScopeDefaults{})
+
+	got, err := store.UpdateSessionChecked(
+		"tg:1", sess.Created,
+		func(*Session) error { return nil },
+		func(s *Session) { s.CWD = "/new" },
+	)
+
+	if err != nil || got == nil || got.CWD != "/new" {
+		t.Fatalf("got = %+v, err = %v, want CWD=/new, nil err", got, err)
+	}
+}
+
+func TestUpdateSessionCheckedReturnsErrSessionNotFoundForMissingCreated(t *testing.T) {
+	store := &Store{Chats: map[string]*ChatSessions{}, Scope: map[string]*ScopeDefaults{}}
+	store.New("tg:1", "one", "/tmp", ScopeDefaults{})
+
+	_, err := store.UpdateSessionChecked("tg:1", 999999, nil, func(*Session) {})
+
+	if err != ErrSessionNotFound {
+		t.Fatalf("err = %v, want ErrSessionNotFound", err)
 	}
 }

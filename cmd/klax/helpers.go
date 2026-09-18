@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"html"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -14,41 +13,6 @@ import (
 	"github.com/PiDmitrius/klax/internal/runner"
 	"github.com/PiDmitrius/klax/internal/session"
 )
-
-// tildePath replaces $HOME prefix with ~ for display.
-func tildePath(path string) string {
-	home, _ := os.UserHomeDir()
-	if strings.HasPrefix(path, home) {
-		return "~" + path[len(home):]
-	}
-	return path
-}
-
-// formatLogItems renders the pre-answer progress log. Tool invocations stay
-// as inline monospace ("техлог"). Narration blocks — the intermediate
-// assistant text demoted by the runner — are full-format text rendered
-// through the same markdown-to-HTML path as the final answer, so lists,
-// code fences and emphasis survive. Adjacent tool labels share a single
-// newline so they stack tightly; any transition involving narration gets a
-// blank line so the formatted text breathes.
-//
-// Narration items are rendered one at a time because the runner cuts only
-// on paragraph boundaries — the "\n\n" between two narration items here is
-// the same separator that was consumed at the cut, so the original
-// paragraph structure of the model's reply is reproduced exactly.
-func formatLogItems(items []runner.ProgressEvent, format string) string {
-	var out strings.Builder
-	var prevKind runner.ProgressKind
-	for i, item := range items {
-		if i > 0 {
-			tight := prevKind == runner.ProgressKindTool && item.Kind == runner.ProgressKindTool
-			out.WriteString(logSeparator(format, tight))
-		}
-		out.WriteString(formatLogItem(item, format))
-		prevKind = item.Kind
-	}
-	return out.String()
-}
 
 // richSpacerBlock is an empty (zero-width) paragraph used as a visual gap between
 // rich blocks. Rich renderers ignore inter-block whitespace, so the "\n\n" blank
@@ -95,6 +59,19 @@ func formatLogItem(item runner.ProgressEvent, format string) string {
 	}
 }
 
+// formatLogChunks renders the pre-answer progress log, split into chunks that
+// fit the messenger limit, with an optional tail segment appended last. Tool
+// invocations stay as inline monospace ("техлог"). Narration blocks — the
+// intermediate assistant text demoted by the runner — are full-format text
+// rendered through the same markdown-to-HTML path as the final answer, so
+// lists, code fences and emphasis survive. Adjacent tool labels share a single
+// newline so they stack tightly; any transition involving narration gets a
+// blank line so the formatted text breathes.
+//
+// Narration items are rendered one at a time because the runner cuts only
+// on paragraph boundaries — the "\n\n" between two narration items here is
+// the same separator that was consumed at the cut, so the original
+// paragraph structure of the model's reply is reproduced exactly.
 func formatLogChunks(items []runner.ProgressEvent, tail, format string, limit int) []string {
 	if len(items) == 0 {
 		if tail == "" {
@@ -217,27 +194,68 @@ func plainFallback(text, format string) string {
 	return text
 }
 
+var (
+	reYMBold = regexp.MustCompile(`(?is)<b>(.*?)</b>`)
+	reYMCode = regexp.MustCompile(`(?is)<code>(.*?)</code>`)
+	reYMPre  = regexp.MustCompile(`(?is)<pre>(.*?)</pre>`)
+	reYMLink = regexp.MustCompile(`(?is)<a href="([^"]*)">(.*?)</a>`)
+)
+
+// htmlToYMMarkdown converts klax's internal command-output HTML into Yandex
+// Messenger's own always-on markdown-like syntax (**bold**, `code`, fenced
+// code blocks, [text](url) links — see YM_API_NOTES.md), which the client
+// actually renders. This is why ym gets its own converter instead of sharing
+// VK's stripHTML: VK has no text formatting at all, so stripping is correct
+// there, but doing the same for ym would throw away real, confirmed-working
+// capability (e.g. the active-session bold marker in /sessions).
+func htmlToYMMarkdown(s string) string {
+	s = reYMPre.ReplaceAllString(s, "```\n$1\n```")
+	s = reYMBold.ReplaceAllString(s, "**$1**")
+	s = reYMCode.ReplaceAllString(s, "`$1`")
+	s = reYMLink.ReplaceAllString(s, "[$2]($1)")
+	s = reBlockClose.ReplaceAllString(s, "$0\n")
+	s = stripHTML(s)
+	for strings.Contains(s, "\n\n\n") {
+		s = strings.ReplaceAll(s, "\n\n\n", "\n\n")
+	}
+	return strings.TrimSpace(s)
+}
+
+// plainRenderForChat renders text for a chat whose transport format is ""
+// (no HTML/markdown parse_mode negotiated by klax): ym has real formatting
+// support of its own, so klax's internal HTML converts to ym's syntax instead
+// of being stripped like it is for VK (which has none).
+func plainRenderForChat(fullChatID, text string) string {
+	if transportPrefix(fullChatID) == "ym" {
+		return htmlToYMMarkdown(text)
+	}
+	return stripHTML(text)
+}
+
 type modelEntry struct {
 	alias string
 	model string // actual --model value
 	label string
 }
 
+// Claude models are launched by their bare CLI alias — the alias resolves to the
+// current model on its own (fable→claude-fable-5, opus→claude-opus-4-8, …), so
+// klax carries no window markers or per-model logic.
 var claudeModels = []modelEntry{
-	{"fable", "fable[1m]", "Claude Fable 1M"},
-	{"opus1m", "opus[1m]", "Claude Opus 1M"},
-	{"opus", "opus", "Claude Opus 200k"},
-	{"sonnet1m", "sonnet[1m]", "Claude Sonnet 1M"},
-	{"sonnet", "sonnet", "Claude Sonnet 200k"},
-	{"haiku", "haiku", "Claude Haiku 200k"},
+	{"fable", "fable", "Fable"},
+	{"opus", "opus", "Opus"},
+	{"sonnet", "sonnet", "Sonnet"},
+	{"haiku", "haiku", "Haiku"},
 }
 
+// Codex: the three GPT-5.6 variants (most-capable first) plus GPT-5.5 as an
+// explicit fallback. "По умолчанию" (empty) covers "let Codex decide". Bare
+// gpt-5.6 is intentionally absent — the local ChatGPT-account Codex rejects it.
 var codexModels = []modelEntry{
+	{"sol", "gpt-5.6-sol", "GPT-5.6 Sol"},
+	{"terra", "gpt-5.6-terra", "GPT-5.6 Terra"},
+	{"luna", "gpt-5.6-luna", "GPT-5.6 Luna"},
 	{"55", "gpt-5.5", "GPT-5.5"},
-	{"54", "gpt-5.4", "GPT-5.4"},
-	{"mini", "gpt-5.4-mini", "GPT-5.4-Mini"},
-	{"codex", "gpt-5.3-codex", "GPT-5.3-Codex"},
-	{"spark", "gpt-5.3-codex-spark", "GPT-5.3-Codex-Spark"},
 }
 
 func modelsForBackend(backend string) []modelEntry {
@@ -247,18 +265,22 @@ func modelsForBackend(backend string) []modelEntry {
 	return claudeModels
 }
 
+// Effort levels start at High: low/medium go unused in practice, and the
+// separate "По умолчанию" (empty) choice already covers "let the CLI decide".
+// The CLI enum still accepts the lower levels — klax simply doesn't offer them.
 var claudeEfforts = []modelEntry{
-	{"low", "low", "Low"},
-	{"med", "medium", "Medium"},
 	{"high", "high", "High"},
+	{"xhigh", "xhigh", "Extra High"},
 	{"max", "max", "Max"},
 }
 
+// Codex GPT-5.6 exposes the deeper Max/Ultra reasoning levels on top of High/
+// Extra High; low/medium stay omitted, "По умолчанию" covers the CLI default.
 var codexEfforts = []modelEntry{
-	{"low", "low", "Low"},
-	{"med", "medium", "Medium"},
 	{"high", "high", "High"},
 	{"xhigh", "xhigh", "Extra High"},
+	{"max", "max", "Max"},
+	{"ultra", "ultra", "Ultra"},
 }
 
 func effortsForBackend(backend string) []modelEntry {
@@ -383,6 +405,22 @@ func (d *daemon) verboseText(chatID string) string {
 	return sb.String()
 }
 
+func (d *daemon) attachmentsText(chatID string) string {
+	mode := d.groupAttachmentMode(chatID)
+	line := func(value string) string {
+		text := "/attachments_" + value
+		if mode == value {
+			return "<b>" + text + " ✅</b>"
+		}
+		return text
+	}
+	return strings.Join([]string{
+		line("on"),
+		line("any"),
+		line("off"),
+	}, "\n")
+}
+
 func (d *daemon) groupModeText(chatID string) string {
 	if !isGroupChatID(chatID) {
 		return ""
@@ -410,6 +448,7 @@ func (d *daemon) settingsText(chatID, sk string, sess *session.Session) string {
 	if groupText := d.groupModeText(chatID); groupText != "" {
 		sections = append(sections, groupText)
 		sections = append(sections, "🗣 Verbose:\n"+strings.TrimSuffix(d.verboseText(chatID), "\n"))
+		sections = append(sections, "📎 Вложения:\n"+strings.TrimSuffix(d.attachmentsText(chatID), "\n"))
 	}
 	return strings.Join(sections, "\n\n")
 }
@@ -487,9 +526,9 @@ func helpText() string {
 /prompt [текст] — системный промпт
 /groups — режим группы
 /verbose — промежуточный вывод группы
+/attachments — режим вложений в группе (off/on/any)
 /rich — Rich-форматирование Telegram (глобально)
 /transports — управление транспортами
-/bypass — прямая команда
 /abort — прервать исполнение
 /backend — backend (claude/codex)
 /usage — лимиты backend

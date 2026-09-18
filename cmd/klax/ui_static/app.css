@@ -1,0 +1,550 @@
+
+  /* Light theme (default) */
+  :root {
+    --bg:#ffffff; --panel:#f5f6f8; --chat:#e6e8ec; --fg:#1f2328; --muted:#6b7280; --border:#e3e5ea;
+    --bubble-user:#dcf3dc; --bubble-assistant:#ffffff; --tool-bg:#eef0f3; --tool-fg:#4b5563;
+    --code-bg:#eceef1; --error-bg:#fdecea; --error-fg:#b3261e; --accent:#008e00; --copy-flash:rgba(30,194,30,.32);
+    --dot:#9fb6a6; --dot-work:#eaa800; --dot-new:#1ec21e; --unread-bg:#e2f6e2; --unread-work-bg:#fff3cf; --warn:#d9a441;
+    --badge-new-top:#1ec21e; --badge-new-mid:#00b500; --badge-new-bottom:#008e00;
+    --badge-new-stroke:#006400;
+    --badge-work-top:#ffc928; --badge-work-mid:#eaa800; --badge-work-bottom:#d19a00;
+    --badge-work-stroke:#a87700;
+    --link:#006400;
+    --tab-active-bg:#ffffff; --tab-active-border:#006400;
+    --compact-block-h:44px;
+    --system-action-w:140px;
+    --attachment-border:#006400;
+    --layer-debug:95; --layer-modal:100; --layer-confirm:105; --layer-notifications:110;
+  }
+  html[data-theme="dark"] {
+    --bg:#15171c; --panel:#1a1d23; --chat:#15171c; --fg:#d8dee9; --muted:#8b92a0; --border:#2a2e37;
+    --bubble-user:#24382a; --bubble-assistant:#232730; --tool-bg:#1c1f26; --tool-fg:#9aa4b6;
+    --code-bg:#14161b; --error-bg:#3a2326; --error-fg:#f0b3b3; --accent:#33c558; --copy-flash:rgba(51,197,88,.28);
+    --dot:#49584d; --dot-work:#f4c948; --dot-new:#2bd02b; --unread-bg:#1f3324; --unread-work-bg:#302819; --warn:#d9a441;
+    --badge-new-top:#2bd02b; --badge-new-mid:#13b813; --badge-new-bottom:#0c8f0c;
+    --badge-new-stroke:#197b19;
+    --badge-work-top:#ffe070; --badge-work-mid:#f4c948; --badge-work-bottom:#d9ad22;
+    --badge-work-stroke:#a77b00;
+    --link:#9ccc65;
+    --tab-active-bg:#232730; --tab-active-border:#33c558;
+  }
+  * { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: var(--muted) transparent; }
+  ::-webkit-scrollbar { width: 11px; height: 11px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background-color: var(--muted); border-radius: 6px;
+                              border: 2px solid transparent; background-clip: padding-box; }
+  @media (hover: hover) { ::-webkit-scrollbar-thumb:hover { background-color: var(--fg); } }
+  body { margin: 0; font: 14px/1.5 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif, "klax-emoji", "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+         background: var(--bg); color: var(--fg); height: 100vh; height: 100dvh;
+         display: flex; flex-direction: column; }
+  /* The canvas around the running app shares the header/footer background. */
+  body:has(#app.active) { background: var(--panel); }
+  a { color: var(--link); text-decoration-color: color-mix(in srgb, var(--link) 65%, transparent); }
+  @media (hover: hover) { a:hover { color: var(--accent); text-decoration-color: currentColor; } }
+  #gate { margin: auto; max-width: 360px; padding: 24px; text-align: center; }
+  #gate input { width: 100%; padding: 10px; margin: 12px 0; border-radius: 8px;
+                border: 1px solid var(--border); background: var(--panel); color: var(--fg); }
+  button { cursor: pointer; border: 1px solid var(--border); background: var(--panel); color: var(--fg);
+           border-radius: 8px; padding: 8px 12px; }
+  @media (hover: hover) { button:hover { border-color: var(--accent); } }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #app { display: none; flex-direction: column; flex: 1; min-height: 0; }
+  #app.active { display: flex; }
+
+  /* Single top panel: tabs + controls */
+  /* Safari's edge colour sampling recognizes fixed/sticky panels. Sticky keeps the header in flow. */
+  #bar { display: flex; align-items: center; gap: 8px;
+         position: sticky; top: 0; z-index: 60; flex-shrink: 0;
+         padding: calc(6px + env(safe-area-inset-top, 0px))
+                  calc(8px + env(safe-area-inset-right, 0px)) 6px
+                  calc(8px + env(safe-area-inset-left, 0px));
+         background: var(--panel); border-bottom: 1px solid var(--border); }
+  #bar, #bar * { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+  #bar .logo-btn { flex: none; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 8px;
+                   background: transparent; display: block; line-height: 0; }
+  @media (hover: hover) { #bar .logo-btn:hover { filter: brightness(1.08); } }
+  #bar .logo { flex: none; display: block; filter: drop-shadow(0 1px 1px rgba(0,0,0,.14)); transition: opacity .2s; }
+  /* Degraded live channel: the poll loop lost the server and is retrying. The brand mark
+     goes amber (the themed work/warning hue) and breathes until a poll succeeds — an
+     explicit "нет соединения" state instead of a UI that looks idle but is silently frozen.
+     CSS wins over the SVG's stop-color/stroke presentation attributes, so no JS repaint. */
+  #bar .logo.degraded rect { stroke: var(--badge-work-stroke); }
+  #bar .logo.degraded stop:nth-child(1) { stop-color: var(--badge-work-top); }
+  #bar .logo.degraded stop:nth-child(2) { stop-color: var(--badge-work-mid); }
+  #bar .logo.degraded stop:nth-child(3) { stop-color: var(--badge-work-bottom); }
+  #bar .logo.degraded { animation: logowarn 1.8s ease-in-out infinite; }
+  @keyframes logowarn { 50% { opacity: .5; } }
+  @media (prefers-reduced-motion: reduce) { #bar .logo.degraded { animation: none; } }
+  /* The strip scrolls horizontally, but overflow-x:auto also clips vertically — cutting the active
+     tab's border and the lifted tab's shadow at the strip edges. Padding enlarges the clip box so both
+     paint fully, and an equal NEGATIVE margin pulls that padding back out of the layout, so the strip's
+     size and the tabs' positions are UNCHANGED — the extra room is purely a bleed area for the shadow.
+     The native scrollbar is hidden (it ate vertical space); tabs.js maps a vertical wheel to this
+     horizontal viewport. The wrapper owns the edge fades and leaves +/theme fixed outside it. */
+  #tabswrap { flex: 1; min-width: 0; position: relative; }
+  #tabs { display: flex; gap: 4px; overflow-x: auto; min-width: 0; scrollbar-width: none;
+          padding: 6px 4px; margin: -6px -4px; }
+  #tabs::-webkit-scrollbar { display: none; }
+  #tabswrap::before, #tabswrap::after { content: ""; position: absolute; z-index: 20; top: -6px; bottom: -6px;
+    width: 22px; pointer-events: none; opacity: 0; transition: opacity .12s ease; }
+  #tabswrap::before { left: -4px; background: linear-gradient(90deg, var(--panel), transparent); }
+  #tabswrap::after { right: -4px; background: linear-gradient(270deg, var(--panel), transparent); }
+  #tabswrap.overflow-left::before, #tabswrap.overflow-right::after { opacity: 1; }
+  /* +/theme share the brand mark's 26px square footprint and corner radius, so the bar reads as one
+     row of equal controls instead of three shapes. The glyph is centred by flex, not by padding —
+     a fixed box must not depend on how wide the character happens to render. */
+  #bar > button:not(.logo-btn) { flex: none; width: 26px; height: 26px; padding: 0; border-radius: 8px;
+                                 display: flex; align-items: center; justify-content: center;
+                                 font-size: 15px; line-height: 1; }
+  #theme { font-size: 13px; }
+  /* Scope chip — the group indicator AND the group switcher in ONE element, shaped like a tab so it
+     introduces no new visual vocabulary. It is absent entirely until the first group exists, so an
+     ungrouped klax keeps exactly the bar it always had. It sits BEFORE the strip (never inside it):
+     inside, it would scroll out of reach exactly when many tabs make it most useful. */
+  #scope { flex: none; position: relative; }
+  #scope.hidden { display: none; }
+  /* A distinctly greyer fill than the bar so the chip reads as a control, not as a label. */
+  .scopebtn { display: flex; align-items: center; gap: 0; max-width: 40vw; height: 26px; padding: 0;
+              border-radius: 8px; border: 1px solid var(--border); background: var(--tool-bg);
+              color: var(--fg); font: inherit; line-height: 1; cursor: pointer; }
+  @media (hover: hover) { .scopebtn:hover { border-color: var(--accent); } }
+  /* The glyph is a FIXED 26px box at the chip's head — the same square as +, at the same position
+     whether it stands alone (root) or a group name follows it. Nothing about the label may move it:
+     padding lives on the label, never on the button. */
+  /* The ≡ is OUR drawing (scope.js SCOPE_GLYPH) and is laid out as if it were a lowercase letter of
+     the neighbouring text: it sits on the BASELINE rather than being centred in a box, which would
+     place it against the em box's middle and read too high. The container therefore carries the SAME
+     font as the text beside it — identical line box, identical baseline. (An earlier version also
+     SIZED the mark in `ex`; that is gone, because a font metric resolves differently per zoom level.
+     The size is now whole pixels, see .scopeicon.) */
+  .scopeglyph { flex: none; width: 26px; text-align: center; font: 12px/1 ui-monospace, monospace; }
+  /* Size in whole CSS px and NO fractional offset here: sub-pixel tuning lives inside the drawing,
+     on the SVG's own half-pixel grid (see SCOPE_GLYPH in scope.js), so the CSS side stays integer.
+     --scope-lift shifts the mark in whole pixels; anything finer belongs in the viewBox. */
+  .scopeicon { display: inline-block; width: 8px; height: 8px; fill: currentColor;
+               vertical-align: var(--scope-lift, 0px); }
+  /* Group names are identifiers, not prose: the same monospace face the tool blocks use. */
+  /* The glyph's 26px box leaves ~8px of side bearing before the name, which reads as a double space.
+     Pull the LABEL back instead of narrowing the box — the box is what keeps the glyph in one fixed
+     position with and without a name. */
+  .scopename { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+               margin-left: -4px; padding-right: 8px; font: 12px/1 ui-monospace, monospace; }
+  /* Group counters are TECHNICAL: "how much is over there", not the green "finished, N new" of a
+     session badge. Different meaning ⇒ deliberately different colour — a flat grey pill, no
+     gradient and no stroke, so the two can never be misread for each other. */
+  .scopecount { margin-right: 8px; background: var(--muted); color: var(--panel);
+                font: 700 11px/1 ui-monospace, monospace; min-width: 17px; height: 17px;
+                padding: 0 4px; border-radius: 5px; display: inline-flex; align-items: center; justify-content: center; }
+  /* Chip collapse depends on viewport width, never strip overflow: changing the chip width changes
+     the strip's overflow and would feed back into the collapse condition. */
+  @media (max-width: 560px) {
+    .scopename { display: none; }
+    .scopecount { margin-right: 6px; }
+  }
+  .scopemenu { position: absolute; z-index: 60; top: calc(100% + 6px); left: 0; min-width: 180px; max-height: 60vh;
+               overflow-y: auto; padding: 4px; border-radius: 10px; border: 1px solid var(--border);
+               background: var(--panel); box-shadow: 0 8px 24px rgba(0,0,0,.18); }
+  .scopemenu.hidden { display: none; }
+  /* No left padding on a row, deliberately: it is what would push the bullets out of line with the
+     chip's glyph. The columns line up by construction —
+       chip:  1px button border + 26px glyph box / 2      = 14px
+       menu:  1px menu border + 4px menu padding + 18px bullet box / 2 = 14px
+     The menu's own 4px padding still keeps the row fill off the border. */
+  .scopeopt { display: flex; align-items: center; gap: 0; padding: 7px 10px 7px 0; border-radius: 7px;
+              color: var(--fg); text-decoration: none; font: 12px/1.4 ui-monospace, monospace; }
+  /* ≡ bullets every row: root is the bare bullet, a group is the bullet plus its name. Same drawn
+     glyph as the chip and the same baseline rule; the font here matches the ROW's, so the bullet and
+     the group name share one baseline. */
+  .scopebullet { flex: none; width: 18px; text-align: center; font: 12px/1.4 ui-monospace, monospace; }
+  /* The gap before the count lives on the NAME, never inside the count: the pill centres its digit
+     with symmetric padding, so touching one side of it moves the digit off-centre. */
+  .scopeoptname { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+                  padding-right: 8px; }
+  /* The count is pinned right whatever the row holds, so the column of numbers stays a column. */
+  .scopeopt .scopecount { margin-left: auto; margin-right: 0; }
+  @media (hover: hover) { .scopeopt:hover { background: var(--tool-bg); color: var(--fg); } }
+  /* The current scope is marked by a fill, not by weight: bold reflows the monospace column and
+     reads as emphasis rather than as state. */
+  .scopeopt.sel { background: var(--chat); }
+  /* An empty scope explains itself; the scope chip remains the navigation back. The log is only
+     HIDDEN, never rebuilt, so returning to a populated scope re-renders from the model. */
+  #scopeempty { display: none; position: absolute; inset: 0; z-index: 30; background: var(--chat); }
+  #transcriptstatus { position: absolute; inset: 0; display: flex; flex-direction: column;
+                      align-items: center; justify-content: center; gap: 12px; padding: 24px;
+                      text-align: center; color: var(--muted); background: var(--chat); }
+  body.emptyscope #scopeempty { display: flex; flex-direction: column; align-items: center; justify-content: center;
+                                gap: 8px; padding: 24px; text-align: center; color: var(--muted); }
+  body.emptyscope #composer, body.emptyscope #tobottom { display: none; }
+  .tab { padding: 6px 12px; border-radius: 8px; white-space: nowrap; cursor: pointer;
+         border: 1px solid transparent; display: flex; align-items: center; gap: 6px; }
+  .tab.active {
+    background: var(--tab-active-bg);
+    border-color: var(--tab-active-border);
+  }
+  .tab.active .dot { background: var(--accent); }
+  .tab .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dot); }
+  .tab:not(.active):not(.busy):not(.unread) .dot { opacity: .8; }
+  .tab.busy .dot { background: var(--dot-work); animation: pulse 1s infinite; } /* working: pulsing amber (clearly != the green idle/done dots) */
+  @keyframes pulse { 50% { opacity: .35; } }
+  .tab.unread { font-weight: 600; background: var(--unread-bg); }              /* finished w/ new msgs */
+  .tab.busy.unread { background: var(--unread-work-bg); }
+  .tab.unread:not(.busy) .dot { background: var(--dot-new); }                  /* solid bright green */
+  /* The active tab keeps its calm look (no loud unread bg) but DOES show a count badge now:
+     it tracks the real remaining unread from the divider to the bottom, draining as you read
+     down. The badge still hides itself when unread hits 0 (the .hidden toggle in renderTabs). */
+  .tab.active.unread { font-weight: inherit; background: var(--tab-active-bg); }
+  /* Unread count — favicon-like when done, same amber as the work dot while busy. */
+  .tab .badge { background: linear-gradient(var(--badge-new-top), var(--badge-new-mid) 50%, var(--badge-new-bottom)); color: #fff; font-size: 11px;
+                font-weight: 700; line-height: 1; min-width: 17px; height: 17px; padding: 0 4px;
+                border-radius: 5px; display: inline-flex; align-items: center; justify-content: center;
+                box-shadow: inset 0 0 0 1px var(--badge-new-stroke); }
+  .tab.busy .badge { background: linear-gradient(var(--badge-work-top), var(--badge-work-mid) 50%, var(--badge-work-bottom)); color: #fff;
+                     box-shadow: inset 0 0 0 1px var(--badge-work-stroke); }
+  .qnote { margin-left: 10px; font-size: 12px; color: var(--muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tab .tname { overflow: hidden; text-overflow: ellipsis; max-width: 22ch; }
+  .tab .tx { margin-left: 2px; color: var(--muted); opacity: 0; font-size: 12px; cursor: pointer; }
+  .tab.active .tx { opacity: .65; }
+  @media (hover: hover) { .tab:hover .tx { opacity: .65; } }
+  @media (hover: hover) { .tab .tx:hover { opacity: 1; color: var(--error-fg); } }
+  /* Drag-and-drop reorder (animated sortable): the grabbed tab LIFTS and glues to the cursor while
+     the others slide apart to open its landing slot; on release it settles into place. No ghost, no
+     marker — the live arrangement IS the preview. The dragged tab's transform is driven inline (JS);
+     these classes carry the lift chrome and the settle transition. */
+  .tab.tabdrag { z-index: 30; position: relative; background: var(--panel);
+    box-shadow: 0 1px 4px rgba(0,0,0,.25); } /* OPAQUE while lifted; light minimal shadow, not bottom-heavy */
+  .tab.active.tabdrag { background: var(--tab-active-bg); border-color: var(--tab-active-border); } /* keep the selected outline */
+  .tab.tabsettle { transition: transform .18s cubic-bezier(.2,.7,.3,1), box-shadow .18s ease; }
+  body.dragging-tab, body.dragging-tab .tab { cursor: grabbing; user-select: none; }
+  .stop { margin-left: 10px; padding: 2px 8px; font-size: 12px; border-radius: 6px; cursor: pointer;
+          background: var(--error-bg); color: var(--error-fg); border: 1px solid var(--border); }
+
+  /* Centred conversation column — on wide desktop the chat does not span the
+     whole screen, so left (klax) and right (user) messages stay close. */
+  #logwrap { flex: 1; min-height: 0; position: relative; display: flex; overflow-x: clip; }
+  #log { flex: 1; overflow-y: auto; overscroll-behavior-y: contain; overflow-anchor: none; scrollbar-gutter: stable both-edges;
+         display: flex; flex-direction: column; align-items: center; background: var(--chat); }
+  #logcol { width: 100%; max-width: 820px;
+            padding: 16px calc(16px + env(safe-area-inset-right, 0px)) 16px calc(16px + env(safe-area-inset-left, 0px));
+            display: flex; flex-direction: column; gap: 10px; }
+  /* One container per user turn: a flex column so .msg.user right-aligns and the answer
+     bubbles + the state indicator stack under their own message (per-turn DOM, §B2). */
+  .turn { display: flex; flex-direction: column; gap: 10px; align-self: stretch; }
+  .msg { position: relative; padding: 8px 12px; border-radius: 10px; word-wrap: break-word; }
+  .msg.join-next { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+  .msg.join-prev { margin-top: -10px; border-top-left-radius: 0; border-top-right-radius: 0;
+                   transition: margin-top .18s ease-out, border-radius .18s ease-out; }
+  .readline { display: flex; align-items: center; gap: 8px; align-self: stretch; color: var(--accent); font-size: 11px; opacity: .9; }
+  .readline::before, .readline::after { content: ""; flex: 1; height: 1px; background: var(--accent); opacity: .45; }
+  /* Live-update motion: genuinely new messages slide in briefly; moved nodes get inline
+     FLIP transforms from render.js; a dismissed unread line fades out in place (the real
+     in-flow node, class .leaving) and only then does the follow-up render collapse the gap. */
+  .turn.enter, .msg.enter { animation: msgin .18s ease-out both; }
+  @keyframes msgin { from { opacity: 0; transform: translateY(10px); } }
+  .readline.leaving { pointer-events: none; animation: lineout .3s ease-in forwards; }
+  @keyframes lineout { to { opacity: 0; } }
+  @keyframes copyflash { 0%, 25% { box-shadow: inset 0 0 0 9999px var(--copy-flash); } 100% { box-shadow: inset 0 0 0 9999px transparent; } }
+  @media (prefers-reduced-motion: reduce) { .turn.enter, .msg.enter, .readline.leaving { animation: none; } }
+  /* klax-side blocks fill the column for a consistent width — only the colour
+     differs between text, tool, error and command output. */
+  .msg.assistant, .msg.tool, .msg.error { align-self: stretch; }
+  .msg.user { align-self: flex-end; max-width: 85%; background: var(--bubble-user); }
+  .msg.assistant { background: var(--bubble-assistant); }
+  .msg.system { align-self: center; font-size: 12px; color: var(--muted); background: transparent; }
+  .msg.tool { font-family: ui-monospace, monospace; font-size: 12px; color: var(--tool-fg); background: var(--tool-bg); }
+  .msg.error { background: var(--error-bg); color: var(--error-fg); }
+  /* typing indicator (work-in-progress marker, like Telegram's "..."): just the animated
+     dots + ✕. The context line is a separate tool bubble below the dots, not beside them. */
+  .msg.typing { align-self: flex-start; width: fit-content; padding: 12px 14px; display: inline-flex; align-items: center; gap: 0; }
+  .msg.typing.queued { max-width: min(520px, 92%); }
+  .dots { display: inline-flex; gap: 5px; align-items: center; }
+  .dots span { width: 7px; height: 7px; border-radius: 50%; background: var(--muted);
+               animation: blink 1.2s infinite both; }
+  .dots span:nth-child(2) { animation-delay: .2s; }
+  .dots span:nth-child(3) { animation-delay: .4s; }
+  @keyframes blink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
+  .msg.typing.queued { opacity: .8; }
+  .msg.typing.queued .dots span { animation: none; opacity: .3; } /* waiting in queue: still, dim */
+
+  /* Every block is separated by exactly one line — consistent everywhere, so
+     headings clearly stand out without leaving oversized gaps. */
+  .body p, .body h1, .body h2, .body h3, .body h4, .body h5, .body h6,
+  .body ul, .body ol, .body pre, .body blockquote, .body table, .body hr { margin: 1.5em 0; }
+  .body > :first-child { margin-top: 0; }
+  .body > :last-child { margin-bottom: 0; }
+  .body h1, .body h2, .body h3, .body h4, .body h5, .body h6 { font-weight: 700; line-height: 1.3; }
+  .body h1 { font-size: 1.3em; } .body h2 { font-size: 1.18em; } .body h3 { font-size: 1.05em; }
+  .body h4, .body h5, .body h6 { font-size: 1em; }
+  .body ul, .body ol { padding-left: 1.5em; }
+  .body li { margin: .2em 0; }
+  .body li > ul, .body li > ol { margin: .2em 0; }
+  .body blockquote { border-left: 3px solid var(--accent); padding: 0 0 0 .9em; color: var(--muted); }
+  .body table { border-collapse: collapse; display: block; overflow-x: auto; max-width: 100%; font-size: .95em; }
+  .body th, .body td { border: 1px solid var(--border); padding: 4px 9px; }
+  .body th { background: var(--tool-bg); font-weight: 700; }
+  .body hr { border: none; border-top: 1px solid var(--border); }
+  .body s { opacity: .65; }
+  .body pre { position: relative; background: var(--code-bg); padding: 8px; border-radius: 6px; overflow-x: auto; }
+  .body pre .copy { position: absolute; top: 6px; right: 6px; padding: 2px 7px; font-size: 12px; line-height: 1;
+                    border: 1px solid var(--border); border-radius: 5px; background: var(--bg); color: var(--muted);
+                    cursor: pointer; opacity: 0; transition: opacity .12s; user-select: none; }
+  @media (hover: hover) { .body pre:hover .copy { opacity: .7; } }
+  @media (hover: hover) { .body pre .copy:hover { opacity: 1; color: var(--fg); } }
+  .body code { background: var(--code-bg); padding: 1px 4px; border-radius: 4px; cursor: pointer; }
+  .body pre code { background: none; padding: 0; cursor: text; }
+  .copyflash { animation: copyflash .38s ease-out; }
+  /* One copy affordance for whole timeline messages and notifications. */
+  .block-copy, .meta { position: absolute; padding: 2px 7px; font-size: 12px; line-height: 1;
+                       border: 1px solid var(--border); border-radius: 5px; background: var(--bg); color: var(--muted);
+                       opacity: 0; transition: opacity .12s; user-select: none; z-index: 2; }
+  .block-copy { top: 6px; right: 6px; cursor: pointer; }
+  /* Message copy keeps its established top-right position and appears with the timestamp on click. */
+  .msg > .block-copy { visibility: hidden; pointer-events: none; }
+  .msg.show-actions > .block-copy { visibility: visible; pointer-events: auto; opacity: .8; }
+  @media (hover: hover) { .notify:hover > .block-copy { opacity: .7; } }
+  .block-copy:focus-visible { opacity: 1; color: var(--fg); }
+  @media (hover: hover) { .block-copy:hover { opacity: 1; color: var(--fg); } }
+  @media (hover: none) { .notify > .block-copy, .body pre .copy { opacity: .45; } }
+  /* GitHub-markdown reading font for conversation prose (assistant + user only) —
+     tabs, composer, tool labels and notices keep the compact UI font. */
+  .msg.assistant .body, .msg.user .body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif, "klax-emoji", "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+    font-size: 16px;
+  }
+  .msg.assistant .body code, .msg.assistant .body pre,
+  .msg.user .body code, .msg.user .body pre {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+
+  /* The timestamp straddles the lower border like a small Telegram-style edge label. It is outside
+     the text flow, so even a one-line bubble neither overlaps copy nor changes size when revealed.
+     For a merged answer bubble this is its LAST block's time. */
+  .meta { right: 8px; bottom: 0; transform: translateY(50%); pointer-events: none; white-space: nowrap;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .msg.show-actions > .meta { opacity: .8; }
+  #more { align-self: center; font-size: 12px; }
+
+  #tobottom { position: absolute; z-index: 3; right: 16px; bottom: 14px; width: 32px; height: 32px;
+              border-radius: 50%; padding: 0; border: none; cursor: pointer;
+              display: flex; align-items: center; justify-content: center;
+              box-shadow: 0 2px 8px rgba(0,0,0,.3); background: #6b7280; color: #fff; }
+  @media (hover: hover) { #tobottom:hover { filter: brightness(1.08); } }
+  #tobottom svg { display: block; }
+  #composer { flex: none; display: flex; justify-content: center;
+              padding: 10px calc(16px + env(safe-area-inset-right, 0px))
+                       calc(10px + env(safe-area-inset-bottom, 0px))
+                       calc(16px + env(safe-area-inset-left, 0px));
+              border-top: 1px solid var(--border); background: var(--panel); }
+  @media (pointer: coarse) {
+    #composer:has(#input:focus) { padding-bottom: 10px; }
+  }
+  #cbar { position: relative; width: 100%; max-width: 788px; display: grid; grid-template-columns: 1fr; grid-template-rows: auto auto; }
+  #inputSizer, #cbar textarea {
+    grid-column: 1; grid-row: 2; width: 100%; min-height: var(--compact-block-h); max-height: 240px;
+    padding: 11px 48px 11px 44px; border-radius: 12px; border: 1px solid var(--border);
+    font: inherit; line-height: 1.4; white-space: pre-wrap; overflow-wrap: break-word;
+  }
+  #inputSizer { visibility: hidden; pointer-events: none; user-select: none; overflow: hidden; }
+  #cbar textarea { position: relative; z-index: 1; resize: none; height: 100%;
+                   background: var(--bg); color: var(--fg); overflow-y: auto; scrollbar-width: none; }
+  #cbar textarea::-webkit-scrollbar { display: none; }
+  /* Send + attach buttons anchor to the bottom row, so they stay aligned with the
+     textarea whether it grows or a chips row sits above it. */
+  #cbar .send, #cbar .attach { position: absolute; bottom: 6px; width: 32px; height: 32px; padding: 0; border: none;
+                border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; z-index: 2; }
+  #cbar .send { right: 7px; background: var(--accent); color: #fff; }
+  @media (hover: hover) { #cbar .send:hover { filter: brightness(1.08); } }
+  #cbar .attach { left: 7px; background: transparent; color: var(--muted); }
+  @media (hover: hover) { #cbar .attach:hover { color: var(--accent); background: var(--tool-bg); } }
+  #cbar .send svg, #cbar .attach svg { display: block; }
+  /* Staged-attachment chips above the textarea */
+  #chips { grid-column: 1; grid-row: 1; display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 8px 0; margin-bottom: 7px; }
+  #chips.hidden { display: none; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; max-width: 200px; padding: 4px 6px 4px 4px;
+          background: var(--tool-bg); border: 2px solid var(--attachment-border); border-radius: 8px; font-size: 12px; }
+  .chip img { width: 28px; height: 28px; object-fit: cover; border-radius: 4px; display: block; flex: none; }
+  .chip .ic { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; font-size: 15px; flex: none; }
+  .chip .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chip .rm { cursor: pointer; color: var(--muted); padding: 0 2px; flex: none; }
+  @media (hover: hover) { .chip .rm:hover { color: var(--error-fg); } }
+  /* Drop highlight while dragging files anywhere over the window */
+  #cbar.drag { outline: 2px dashed var(--accent); outline-offset: 3px; }
+  /* Inline images the agent produced (served via /api/file capability refs) */
+  .body img.att { width: auto; height: auto; max-width: 100%; max-height: 420px; object-fit: contain;
+                  border: 2px solid var(--attachment-border); border-radius: 8px; margin: 6px 0; display: block; box-sizing: border-box; }
+  .body .att-file { display: inline-block; margin: 4px 0; padding: 2px 8px; background: var(--tool-bg);
+                    border: 1px solid var(--border); border-radius: 8px; font-size: 13px; }
+  /* System notices live in the timeline viewport, whose normal-flow bottom is the composer top. */
+  #notifications { position: absolute; bottom: 12px; right: 16px; z-index: var(--layer-notifications); display: flex;
+                   flex-direction: column; gap: 8px; pointer-events: none;
+                   width: 400px; max-width: calc(100% - 32px); }
+  .notify { background: var(--panel); border: 1px solid var(--border); color: var(--fg);
+            position: relative; padding: 9px 42px 9px 11px; border-radius: 8px; font: 13px/1.4 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+            min-height: var(--compact-block-h);
+            pointer-events: auto; cursor: pointer; max-height: 200px; overflow: hidden;
+            display: grid; grid-template-columns: 20px minmax(0,1fr); align-items: center; gap: 9px;
+            overflow-wrap: anywhere; box-shadow: 0 4px 8px rgba(0,0,0,.25);
+            opacity: 0; transform: translateX(30px); transition: opacity .35s ease, transform .35s ease; }
+  .notify.visible { opacity: 1; transform: translateX(0); }
+  .notify.info { border-color: var(--accent); }
+  .notify.warning { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, var(--panel)); }
+  .notify.error { border-color: var(--error-fg); background: var(--error-bg); }
+  .notify-icon { width: 20px; height: 20px; display: flex; align-items: center; justify-content: center;
+                 font-family: -apple-system, system-ui, sans-serif; font-size: 17px; line-height: 20px; font-weight: 700; color: var(--accent); }
+  .notify.warning .notify-icon { color: var(--warn); }
+  .notify.error .notify-icon { color: var(--error-fg); font-size: 20px; }
+  .notify-text { white-space: pre-wrap; min-width: 0; }
+  .notify.fade-out { opacity: 0; transform: translateX(40px); }
+  .notify.collapse { height: 0 !important; min-height: 0 !important; padding-top: 0 !important; padding-bottom: 0 !important;
+                     margin-top: -8px; border-width: 0;
+                     transition: height .28s ease, padding .28s ease, margin .28s ease, border-width .28s ease; }
+  /* custom dialog (replaces system confirm/prompt, keeps the UI style) */
+  #modal { position: fixed; inset: 0; z-index: var(--layer-confirm); display: flex; align-items: center; justify-content: center;
+           background: rgba(0,0,0,.45); }
+  .modal-box { width: 340px; max-width: 90vw; background: var(--bg); color: var(--fg);
+               border: 1px solid var(--border); border-radius: 12px; padding: 18px;
+               box-shadow: 0 12px 44px rgba(0,0,0,.35); }
+  .modal-box:focus { outline: none; }
+  .modal-msg { margin-bottom: 12px; }
+  .modal-input { width: 100%; padding: 9px 11px; margin-bottom: 14px; border-radius: 8px;
+                 border: 1px solid var(--border); background: var(--panel); color: var(--fg); font: inherit; }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+  .modal-actions button { padding: 7px 16px; }
+  .modal-ok { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .modal-ok.danger { background: #d92d20; border-color: #d92d20; }
+  /* application/runtime status dialog */
+  #sysmodal { position: fixed; inset: 0; z-index: var(--layer-modal); display: flex; align-items: center; justify-content: center;
+              background: rgba(0,0,0,.45); }
+  .sysmodal-box { width: 500px; max-width: 92vw; background: var(--bg); color: var(--fg);
+                  border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px 18px;
+                  box-shadow: 0 12px 44px rgba(0,0,0,.35); }
+  .sysmodal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .sysmodal-title { font-weight: 600; font-size: 15px; }
+  .sysmodal-x { background: none; border: none; color: var(--muted); font-size: 15px; line-height: 1; padding: 2px 6px; }
+  @media (hover: hover) { .sysmodal-x:hover { color: var(--error-fg); } }
+  .sysrow { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; min-height: 27px; font-size: 13px; }
+  .syskey { color: var(--muted); flex: none; }
+  .sysvalgroup { min-width: 0; display: inline-flex; align-items: center; justify-content: flex-end; gap: 8px; text-align: right; }
+  .sysval { min-width: 0; overflow-wrap: anywhere; }
+  code.syscode { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; cursor: pointer; overflow-wrap: anywhere; }
+  .syscheck, .sysaction { width: var(--system-action-w); background: var(--bg); color: var(--fg); }
+  .sysaction.update { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .sysreleases { margin: 6px 0 2px; display: flex; flex-direction: column; gap: 7px; }
+  .sysrelease { display: grid; grid-template-columns: 12px auto minmax(72px,1fr) auto; align-items: center; gap: 9px; }
+  .sysbullet { color: var(--muted); font-size: 16px; line-height: 1; text-align: center; }
+  .sysrelease-empty { color: var(--muted); font-size: 12px; padding-left: 21px; }
+  .sysage { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .syssep { height: 1px; background: var(--border); margin: 9px 0; opacity: .6; }
+  .sysmodal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+  .syscheck:disabled, .sysaction:disabled { opacity: .5; cursor: wait; }
+  /* per-session settings dialog (double-click a tab) */
+  #smodal { position: fixed; inset: 0; z-index: var(--layer-modal); display: flex; align-items: center; justify-content: center;
+            background: rgba(0,0,0,.45); }
+  .smodal-box { width: 430px; max-width: 92vw; background: var(--bg); color: var(--fg);
+                border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px 18px;
+                box-shadow: 0 12px 44px rgba(0,0,0,.35); }
+  .smodal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .smodal-title { font-weight: 600; font-size: 15px; }
+  .smodal-x { background: none; border: none; color: var(--muted); font-size: 15px; cursor: pointer;
+              line-height: 1; padding: 2px 6px; border-radius: 6px; }
+  @media (hover: hover) { .smodal-x:hover { color: var(--error-fg); } }
+  .srow { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 32px; margin-bottom: 8px; }
+  .srow > label { color: var(--muted); font-size: 13px; flex: none; }
+  .srow .sctl { flex: 1; display: flex; justify-content: flex-end; }
+  .sname { width: 240px; max-width: 100%; padding: 7px 9px; border-radius: 8px;
+           border: 1px solid var(--border); background: var(--panel); color: var(--fg); font: inherit; }
+  .sname:disabled, .stoggle input:disabled { opacity: .45; cursor: not-allowed; }
+  /* Custom dropdown (tabs.js selectHTML) — replaces the native <select> so it matches the UI and its
+     open state is ours to see (background refreshes hold off while a menu is open). */
+  .sselect { position: relative; width: 240px; max-width: 100%; }
+  .sselect-btn { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+                 padding: 7px 9px; border-radius: 8px; border: 1px solid var(--border);
+                 background: var(--panel); color: var(--fg); font: inherit; cursor: pointer; text-align: left; }
+  .sselect.open .sselect-btn { border-color: var(--accent); }
+  @media (hover: hover) { .sselect-btn:hover { border-color: var(--accent); } }
+  .sselect-cur { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sselect-caret { flex: none; color: var(--muted); font-size: 10px; transition: transform .15s; }
+  .sselect.open .sselect-caret { transform: rotate(180deg); }
+  .sselect.disabled { opacity: .45; }
+  .sselect.disabled .sselect-btn { cursor: not-allowed; pointer-events: none; }
+  .sselect-menu { position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 10;
+                  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+                  box-shadow: 0 8px 24px rgba(0,0,0,.3); padding: 4px; max-height: 232px; overflow-y: auto; }
+  .sselect-opt { padding: 7px 9px; border-radius: 6px; cursor: pointer; font-size: 13px;
+                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  @media (hover: hover) { .sselect-opt:hover { background: var(--tool-bg); } }
+  .sselect-opt.sel { color: var(--accent); font-weight: 600; }
+  /* Groups: a row of chips plus one "+" that opens the existing groups. Nothing is typed as prose,
+     so there is no comma syntax to get wrong and no ambiguity about what is already applied. */
+  /* One height for EVERY child of the row (chip, +, the inline input) so replacing + with the input
+     cannot change the row's height — the dialog is vertically centred, so any height change moves
+     the whole box under the cursor. */
+  .sgroups { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-height: 28px; }
+  .sgroup { height: 28px; display: inline-flex; align-items: center; gap: 5px; padding: 0 5px 0 9px;
+          font: 12px/1 ui-monospace, monospace;
+          border-radius: 8px; border: 1px solid var(--border); background: var(--tool-bg); }
+  .sgroupx { width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center;
+           border: 0; background: transparent; color: var(--muted); padding: 0; font-size: 11px;
+           line-height: 1; border-radius: 4px; }
+  @media (hover: hover) { .sgroupx:hover { color: var(--error-fg); border-color: transparent; } }
+  .sgroupadd { width: auto; height: 28px; }       /* not the 240px of a settings dropdown */
+  /* The + is a bare text node, so it cannot be transformed on its own — and transforming the BUTTON
+     would drag its border out of the row. A 2px bottom padding shrinks the content box inside the
+     fixed 28px square instead, lifting the centred glyph by one pixel. */
+  .sgroupadd .sselect-btn { width: 28px; height: 28px; padding: 0 0 2px; justify-content: center;
+                          font-size: 15px; line-height: 1; }
+  .sgroupadd .sselect-menu { left: 0; right: auto; min-width: 160px; }
+  .sgroupadd .sselect-opt { font: 12px/1.4 ui-monospace, monospace; }
+  /* The "new group" affordance is just "…" — an ellipsis reads as "type it yourself" without
+     spending a line of prose in a column of identifiers. */
+  .sgroupnewopt { color: var(--muted); font-family: inherit; font-size: 13px; }
+  .sgroupnew { height: 28px; width: auto !important; min-width: 140px; padding: 0 9px !important;
+             font: 12px/1 ui-monospace, monospace; }
+  .stoggle { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; font-size: 13px; }
+  .stoggle input { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
+  .shint { color: var(--muted); font-size: 11px; margin: 0 0 8px; }
+  .sfield { margin-bottom: 10px; }
+  .sfield > label { display: block; color: var(--muted); font-size: 13px; margin-bottom: 5px; }
+  .sfield input, .sfield textarea { width: 100%; padding: 7px 9px; border-radius: 8px;
+                 border: 1px solid var(--border); background: var(--panel); color: var(--fg); font: inherit; }
+  .sfield textarea { resize: vertical; min-height: 34px; line-height: 1.4; } /* one line by default; drag to grow */
+  .sfield input:disabled, .sfield textarea:disabled { opacity: .45; cursor: not-allowed; }
+  .sbusy { background: var(--tool-bg); color: var(--tool-fg); border-radius: 8px; padding: 7px 10px;
+           font-size: 12px; margin-bottom: 12px; }
+  .ssep { height: 1px; background: var(--border); margin: 12px 0; opacity: .6; }
+  .sfact { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; font-size: 12px; margin-top: 6px; }
+  .sfact-k { color: var(--muted); flex: none; }
+  .sfact-v { color: var(--fg); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* The UUID is click-to-copy and MUST look identical to inline code everywhere else
+     (timeline .body code) — same chip + the same shared .copyflash animation on copy. */
+  .sfact code.suuid { background: var(--code-bg); padding: 1px 4px; border-radius: 4px; cursor: pointer;
+    overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .smodal-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
+  .smodal-ok { min-width: 76px; background: var(--accent); color: #fff; border-color: var(--accent); }
+  .hidden { display: none !important; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .notify { transition: opacity .12s ease; transform: none; }
+    .notify.fade-out { transform: none; }
+    .notify.collapse { transition: height .12s ease, padding .12s ease, margin .12s ease, border-width .12s ease; }
+  }
+
+  /* Mobile Safari auto-zooms focused form controls whose text is smaller than 16px and does not
+     restore the old scale when the keyboard closes. Keep manual pinch zoom available; only remove
+     that automatic trigger. inputSizer must match the composer exactly for correct auto-growth. */
+  @media (any-pointer: coarse) {
+    #inputSizer, input, textarea, select, [contenteditable]:not([contenteditable="false"]) { font-size: 16px !important; }
+  }
+
+  /* Explicit local visual harness: /?debug. It is absent from the normal UI. */
+  #debugpanel { position: fixed; left: 16px; top: 70px; z-index: var(--layer-debug); width: 190px; padding: 10px;
+                background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+                box-shadow: 0 8px 28px rgba(0,0,0,.25); }
+  .debug-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;
+                font: 12px/1.2 ui-monospace, monospace; color: var(--muted); }
+  .debug-close { padding: 1px 4px; border: 0; background: transparent; color: var(--muted); }
+  .debug-actions { display: flex; flex-direction: column; gap: 6px; }
+  .debug-actions button { width: 100%; padding: 6px 8px; text-align: left; font-size: 12px; }
+
+#cbar.read-only { filter: grayscale(1); opacity: .5; }
+#cbar.read-only button, #cbar.read-only input, #cbar.read-only textarea, .stop:disabled { cursor: default; }
+.tab .tx.disabled { opacity: .3; pointer-events: none; }

@@ -9,11 +9,14 @@ import (
 // UserIdentity maps platform-specific IDs to a canonical user.
 // Sessions in DMs are shared across platforms for the same user.
 type UserIdentity struct {
-	ID         string `json:"id"`                 // canonical user ID (e.g. "claw")
-	TelegramID int64  `json:"tg_id,omitempty"`    // Telegram user ID
-	MaxID      int64  `json:"mx_id,omitempty"`    // MAX user ID
-	VKID       int64  `json:"vk_id,omitempty"`    // VK user ID
-	UIToken    string `json:"ui_token,omitempty"` // bearer token authenticating as this user in the web UI
+	ID          string `json:"id"`                 // canonical user ID (e.g. "alice")
+	TelegramID  int64  `json:"tg_id,omitempty"`    // Telegram user ID
+	MaxID       int64  `json:"mx_id,omitempty"`    // MAX user ID
+	VKID        int64  `json:"vk_id,omitempty"`    // VK user ID
+	YmLogin     string `json:"ym_login,omitempty"` // Yandex Messenger login (e.g. "vasya@example.org")
+	UIReadToken string `json:"ui_read_token,omitempty"`
+	UIToken     string `json:"ui_token,omitempty"` // bearer token authenticating as this user in the web UI
+	CWD         string `json:"cwd,omitempty"`      // default working directory for this user's new DM/UI sessions
 }
 
 // BackendConfig holds per-backend settings.
@@ -21,6 +24,21 @@ type BackendConfig struct {
 	PermissionMode string `json:"permission_mode"` // claude: acceptEdits | bypassPermissions | auto
 	Sandbox        string `json:"sandbox"`         // codex: read-only | workspace-write | danger-full-access
 	FullAuto       bool   `json:"full_auto"`       // codex: --full-auto shortcut
+}
+
+// AuditHookConfig is one synchronous audit boundary executable. Command is
+// executed directly (never through a shell) and receives one JSON event on stdin.
+type AuditHookConfig struct {
+	Command []string `json:"command"`
+}
+
+type AuditConfig struct {
+	Turn *AuditTurnConfig `json:"turn,omitempty"`
+}
+
+type AuditTurnConfig struct {
+	Start  *AuditHookConfig `json:"start,omitempty"`
+	Finish *AuditHookConfig `json:"finish,omitempty"`
 }
 
 // Config is stored at ~/.config/klax/config.json
@@ -43,6 +61,9 @@ type Config struct {
 	VKToken        string `json:"vk_token"`
 	VKAllowedUsers []int  `json:"vk_allowed_users"` // VK user IDs
 
+	YmToken        string   `json:"ym_token"`
+	YmAllowedUsers []string `json:"ym_allowed_users"` // Yandex Messenger logins (e.g. "vasya@example.org")
+
 	Users              []UserIdentity `json:"users"`               // cross-platform identity mapping
 	DisabledTransports []string       `json:"disabled_transports"` // transports disabled via /transports off
 	GroupChats         []GroupChat    `json:"group_chats"`         // chats with group mode enabled
@@ -53,12 +74,16 @@ type Config struct {
 	TelegramRich bool `json:"tg_rich,omitempty"`
 
 	// UIListen is the address the web UI server binds to (e.g. "127.0.0.1:8799").
-	// Empty disables the UI. Access is per-user via UserIdentity.UIToken.
+	// Empty disables the UI. Access uses the user's management or viewing token.
 	UIListen string `json:"ui_listen,omitempty"`
 
 	// UITitle is the product name shown in the web UI (browser tab title and the
 	// login screen heading). Empty falls back to "klax".
 	UITitle string `json:"ui_title,omitempty"`
+
+	// Audit, when configured, observes the two synchronous turn boundaries.
+	// Start failure blocks backend execution; finish failure is a durable warning.
+	Audit *AuditConfig `json:"audit,omitempty"`
 }
 
 // GroupChat stores group mode settings for a chat.
@@ -167,6 +192,9 @@ func normalize(c *Config) *Config {
 	}
 	if c.VKAllowedUsers == nil {
 		c.VKAllowedUsers = []int{}
+	}
+	if c.YmAllowedUsers == nil {
+		c.YmAllowedUsers = []string{}
 	}
 	if c.Users == nil {
 		c.Users = []UserIdentity{}
