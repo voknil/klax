@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"mime"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -19,6 +20,49 @@ var outLinkRe = regexp.MustCompile(`(!?)\[([^\]]*)\]\(([^)\s]+)\)`)
 // maxOutboundFiles caps how many local files one answer can publish (a budget, not a
 // security boundary — confinement does that).
 const maxOutboundFiles = 16
+
+// outboundFiles returns local files referenced by an agent answer. The same
+// confinement rule as the web UI is used: only existing files below the
+// session working directory are eligible for upload.
+func outboundFiles(md, cwd string) []struct {
+	name, contentType string
+	data              []byte
+} {
+	if md == "" || cwd == "" || !strings.Contains(md, "](") {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var out []struct {
+		name, contentType string
+		data              []byte
+	}
+	outLinkRe.ReplaceAllStringFunc(md, func(m string) string {
+		if len(out) >= maxOutboundFiles {
+			return m
+		}
+		sub := outLinkRe.FindStringSubmatch(m)
+		href := sub[3]
+		if isRemoteHref(href) {
+			return m
+		}
+		real, ok := resolveInRoot(href, cwd, []string{cwd})
+		if !ok || seen[real] {
+			return m
+		}
+		data, err := os.ReadFile(real)
+		if err != nil {
+			return m
+		}
+		seen[real] = true
+		ct := mime.TypeByExtension(filepath.Ext(real))
+		out = append(out, struct {
+			name, contentType string
+			data              []byte
+		}{sanitizeAttachmentFilename(filepath.Base(real)), ct, data})
+		return m
+	})
+	return out
+}
 
 // rewriteOutboundForUI rewrites an agent answer's local file links to /api/file?ref= capability
 // URLs. A link that cannot be confined or snapshotted degrades to its plain label. UI-only.

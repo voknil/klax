@@ -15,6 +15,13 @@ type Transport interface {
 	EditMessage(chatID, messageID, text, replyTo, format string) error
 }
 
+// FileSender is an optional capability implemented by transports that can
+// upload a local file and deliver it as an attachment. Keeping this separate
+// from Transport preserves text-only transports and the web UI adapter.
+type FileSender interface {
+	SendFile(chatID, name, contentType string, data []byte, caption, replyTo string) error
+}
+
 // APIError represents a messenger API error with enough detail for retry decisions.
 type APIError struct {
 	Platform    string // "tg", "max", "vk"
