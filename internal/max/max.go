@@ -18,7 +18,8 @@ import (
 	"github.com/PiDmitrius/klax/internal/transport"
 )
 
-const apiBase = "https://platform-api2.max.ru"
+// apiBase is a var so transport tests can point the client at an httptest server.
+var apiBase = "https://platform-api2.max.ru"
 
 type Bot struct {
 	token  string
