@@ -202,3 +202,34 @@ func TestRewriteOutboundResolvesAfterRestart(t *testing.T) {
 		t.Fatalf("after restart the link changed:\n first=%q\nsecond=%q", first, second)
 	}
 }
+
+func TestOutboundFilesPolicy(t *testing.T) {
+	cwd := t.TempDir()
+	write := func(name string, data []byte) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(cwd, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("ok.pdf", []byte("pdf"))
+	write(".env", []byte("TOKEN=secret"))
+	write("private.pem", []byte("key"))
+	write("empty.txt", nil)
+	write("large.bin", make([]byte, maxOutboundFileSize+1))
+
+	got := outboundFiles("[ok](ok.pdf) [.env](.env) [key](private.pem) [empty](empty.txt) [large](large.bin)", cwd)
+	if len(got) != 1 || got[0].name != "ok.pdf" || string(got[0].data) != "pdf" {
+		t.Fatalf("policy result = %#v, want only ok.pdf", got)
+	}
+}
+
+func TestOutboundFilesRejectsOutsideRootAndRemoteLinks(t *testing.T) {
+	cwd, outside := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	md := "[outside](" + filepath.Join(outside, "secret.txt") + ") [web](https://example.test/a) [anchor](#x)"
+	if got := outboundFiles(md, cwd); len(got) != 0 {
+		t.Fatalf("outboundFiles returned files for unsafe links: %#v", got)
+	}
+}

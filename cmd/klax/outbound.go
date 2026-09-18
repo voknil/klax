@@ -21,6 +21,16 @@ var outLinkRe = regexp.MustCompile(`(!?)\[([^\]]*)\]\(([^)\s]+)\)`)
 // security boundary — confinement does that).
 const maxOutboundFiles = 16
 
+// Telegram's sendDocument limit is 50 MB. Keep one conservative limit for
+// every messenger so the same answer behaves consistently in Telegram and
+// MAX (whose limits are larger for some media types).
+const maxOutboundFileSize = 50 << 20
+
+var blockedOutboundExtensions = map[string]bool{
+	".key": true, ".pem": true, ".p12": true, ".pfx": true,
+	".jks": true, ".keystore": true,
+}
+
 // outboundFiles returns local files referenced by an agent answer. The same
 // confinement rule as the web UI is used: only existing files below the
 // session working directory are eligible for upload.
@@ -49,12 +59,22 @@ func outboundFiles(md, cwd string) []struct {
 		if !ok || seen[real] {
 			return m
 		}
+		if !outboundFileAllowed(real) {
+			return m
+		}
+		info, err := os.Stat(real)
+		if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxOutboundFileSize {
+			return m
+		}
 		data, err := os.ReadFile(real)
 		if err != nil {
 			return m
 		}
 		seen[real] = true
 		ct := mime.TypeByExtension(filepath.Ext(real))
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
 		out = append(out, struct {
 			name, contentType string
 			data              []byte
@@ -62,6 +82,23 @@ func outboundFiles(md, cwd string) []struct {
 		return m
 	})
 	return out
+}
+
+// outboundFileAllowed blocks common credential/key locations. The file-link
+// UI has its own capability controls; messenger uploads need this additional
+// guard because the bytes leave the host and cannot be revoked afterwards.
+func outboundFileAllowed(path string) bool {
+	for _, part := range strings.Split(filepath.Clean(path), string(filepath.Separator)) {
+		lower := strings.ToLower(part)
+		if lower == ".git" || lower == ".ssh" {
+			return false
+		}
+	}
+	base := strings.ToLower(filepath.Base(path))
+	if base == ".env" || strings.HasPrefix(base, ".env.") || base == "id_rsa" || base == "id_ed25519" || base == "authorized_keys" || base == "known_hosts" {
+		return false
+	}
+	return !blockedOutboundExtensions[strings.ToLower(filepath.Ext(base))]
 }
 
 // rewriteOutboundForUI rewrites an agent answer's local file links to /api/file?ref= capability
