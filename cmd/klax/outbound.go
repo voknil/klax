@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"mime"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -62,18 +64,14 @@ func outboundFiles(md, cwd string) []struct {
 		if !outboundFileAllowed(real) {
 			return m
 		}
-		info, err := os.Stat(real)
-		if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxOutboundFileSize {
-			return m
-		}
-		data, err := os.ReadFile(real)
+		data, err := readOutboundFile(real)
 		if err != nil {
 			return m
 		}
 		seen[real] = true
 		ct := mime.TypeByExtension(filepath.Ext(real))
 		if ct == "" {
-			ct = "application/octet-stream"
+			ct = http.DetectContentType(data)
 		}
 		out = append(out, struct {
 			name, contentType string
@@ -82,6 +80,33 @@ func outboundFiles(md, cwd string) []struct {
 		return m
 	})
 	return out
+}
+
+// readOutboundFile re-checks the size while reading. A stat-then-ReadFile
+// sequence alone is racy if the agent replaces the file between those calls.
+// The extra byte lets us reject growth past the transport limit without
+// allocating unbounded memory.
+func readOutboundFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxOutboundFileSize {
+		if err == nil {
+			err = fmt.Errorf("file is empty, non-regular, or exceeds %d bytes", maxOutboundFileSize)
+		}
+		return nil, err
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxOutboundFileSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxOutboundFileSize {
+		return nil, fmt.Errorf("file exceeds %d bytes", maxOutboundFileSize)
+	}
+	return data, nil
 }
 
 // outboundFileAllowed blocks common credential/key locations. The file-link

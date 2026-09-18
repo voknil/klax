@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/PiDmitrius/klax/internal/transport"
 )
@@ -338,7 +339,20 @@ func (b *Bot) SendFile(chatID, name, contentType string, data []byte, caption, r
 	if err != nil {
 		return err
 	}
-	return b.sendRawMessage(chatID, encoded)
+	for attempt := 0; attempt < 3; attempt++ {
+		err := b.sendRawMessage(chatID, encoded)
+		if err == nil {
+			return nil
+		}
+		// MAX may need time to process a freshly uploaded attachment.
+		// Retry only that transient condition; do not duplicate arbitrary
+		// failed messages or hide permanent API errors.
+		if !strings.Contains(err.Error(), "attachment.not.ready") || attempt == 2 {
+			return err
+		}
+		time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+	}
+	return nil
 }
 
 func (b *Bot) sendRawMessage(chatID string, body []byte) error {
