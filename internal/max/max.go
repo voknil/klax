@@ -5,14 +5,21 @@ package max
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
+	"path/filepath"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/PiDmitrius/klax/internal/transport"
 )
 
-const apiBase = "https://platform-api2.max.ru"
+// apiBase is a var so transport tests can point the client at an httptest server.
+var apiBase = "https://platform-api2.max.ru"
 
 type Bot struct {
 	token  string
@@ -239,6 +246,133 @@ func (b *Bot) SendMessage(chatID, text, replyTo, format string) error {
 // SendMessageReturnID sends a message and returns its mid.
 func (b *Bot) SendMessageReturnID(chatID, text, replyTo, format string) (string, error) {
 	return b.sendMsg(chatID, text, replyTo, format)
+}
+
+// SendFile uploads a local file and sends it as a MAX attachment. MAX requires
+// a type-specific upload URL before the attachment token can be used in a
+// message.
+func (b *Bot) SendFile(chatID, name, contentType string, data []byte, caption, replyTo string) error {
+	typ := "file"
+	switch {
+	case strings.HasPrefix(contentType, "image/"):
+		typ = "image"
+	case strings.HasPrefix(contentType, "video/"):
+		typ = "video"
+	case strings.HasPrefix(contentType, "audio/"):
+		typ = "audio"
+	}
+
+	resp, err := b.request("POST", "/uploads?type="+typ, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		return httpError(resp.StatusCode, "POST /uploads: "+string(raw))
+	}
+	var upload struct {
+		URL   string `json:"url"`
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&upload); err != nil {
+		return err
+	}
+	if upload.URL == "" {
+		return fmt.Errorf("MAX upload response has no URL")
+	}
+
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="data"; filename=%q`, filepath.Base(name)))
+	if contentType != "" {
+		h.Set("Content-Type", contentType)
+	}
+	part, err := mw.CreatePart(h)
+	if err != nil {
+		return err
+	}
+	if _, err := part.Write(data); err != nil {
+		return err
+	}
+	if err := mw.Close(); err != nil {
+		return err
+	}
+	uploadReq, err := http.NewRequest(http.MethodPost, upload.URL, &body)
+	if err != nil {
+		return err
+	}
+	uploadReq.Header.Set("Content-Type", mw.FormDataContentType())
+	uploadResp, err := b.client.Do(uploadReq)
+	if err != nil {
+		return err
+	}
+	defer uploadResp.Body.Close()
+	if uploadResp.StatusCode < 200 || uploadResp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(uploadResp.Body)
+		return httpError(uploadResp.StatusCode, "upload: "+string(raw))
+	}
+	if upload.Token == "" {
+		var result struct {
+			Token string `json:"token"`
+		}
+		if err := json.NewDecoder(uploadResp.Body).Decode(&result); err != nil {
+			return err
+		}
+		upload.Token = result.Token
+	}
+	if upload.Token == "" {
+		return fmt.Errorf("MAX upload response has no token")
+	}
+
+	payload := map[string]interface{}{"token": upload.Token}
+	message := map[string]interface{}{
+		"attachments": []interface{}{map[string]interface{}{"type": typ, "payload": payload}},
+	}
+	if caption != "" {
+		message["text"] = caption
+	}
+	if replyTo != "" {
+		message["link"] = map[string]string{"type": "reply", "mid": replyTo}
+	}
+	encoded, err := json.Marshal(message)
+	if err != nil {
+		return err
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		err := b.sendRawMessage(chatID, encoded)
+		if err == nil {
+			return nil
+		}
+		// MAX may need time to process a freshly uploaded attachment.
+		// Retry only that transient condition; do not duplicate arbitrary
+		// failed messages or hide permanent API errors.
+		if !strings.Contains(err.Error(), "attachment.not.ready") || attempt == 2 {
+			return err
+		}
+		time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+	}
+	return nil
+}
+
+func (b *Bot) sendRawMessage(chatID string, body []byte) error {
+	var query string
+	if id, err := strconv.ParseInt(chatID, 10, 64); err == nil && id > 0 {
+		query = "/messages?user_id=" + chatID
+	} else {
+		query = "/messages?chat_id=" + chatID
+	}
+	resp, err := b.request("POST", query, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		return httpError(resp.StatusCode, "POST /messages: "+string(raw))
+	}
+	return nil
 }
 
 func (b *Bot) sendMsg(chatID, text, replyTo, format string) (string, error) {

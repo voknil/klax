@@ -97,7 +97,7 @@ func downloadRelease(tag string) (string, error) {
 
 func downloadReleaseTo(tag string, out io.Writer) (string, error) {
 	arch := runtime.GOARCH
-	name := fmt.Sprintf("klax-%s-linux-%s", tag, arch)
+	name := fmt.Sprintf("klax-%s-%s-%s", tag, runtime.GOOS, arch)
 	url := fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", repo, tag, name)
 
 	fmt.Fprintf(out, "downloading %s...\n", name)

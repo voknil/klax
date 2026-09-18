@@ -1,6 +1,8 @@
 package tg
 
 import (
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -56,5 +58,46 @@ func TestGetMeReturnsAPIErrorWhenNotOK(t *testing.T) {
 	apiErr, ok := err.(*APIError)
 	if !ok || apiErr.Code != 401 {
 		t.Fatalf("err = %v, want *APIError with code 401", err)
+	}
+}
+
+func TestSendFileUploadsDocumentAndReply(t *testing.T) {
+	b := newTestBot(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/bottest-token/sendDocument" {
+			t.Fatalf("path = %q, want sendDocument", r.URL.Path)
+		}
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Fatalf("ParseMultipartForm: %v", err)
+		}
+		file, hdr, err := r.FormFile("document")
+		if err != nil {
+			t.Fatalf("document part: %v", err)
+		}
+		defer file.Close()
+		data, err := io.ReadAll(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hdr.Filename != "report.pdf" || string(data) != "payload" {
+			t.Fatalf("uploaded file = %q/%q, want report.pdf/payload", hdr.Filename, data)
+		}
+		if got := r.FormValue("chat_id"); got != "123" {
+			t.Errorf("chat_id = %q, want 123", got)
+		}
+		var reply struct {
+			MessageID int `json:"message_id"`
+		}
+		if err := json.Unmarshal([]byte(r.FormValue("reply_parameters")), &reply); err != nil {
+			t.Fatalf("reply_parameters: %v", err)
+		}
+		if reply.MessageID != 7 || r.FormValue("caption") != "result" {
+			t.Fatalf("reply/caption = %d/%q, want 7/result", reply.MessageID, r.FormValue("caption"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":8}}`)
+	})
+
+	if err := b.SendFile("123", "report.pdf", "application/pdf", []byte("payload"), "result", "7"); err != nil {
+		t.Fatalf("SendFile: %v", err)
 	}
 }

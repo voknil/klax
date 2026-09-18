@@ -10,6 +10,7 @@ import (
 
 	"github.com/PiDmitrius/klax/internal/mdhtml"
 	"github.com/PiDmitrius/klax/internal/runner"
+	"github.com/PiDmitrius/klax/internal/transport"
 )
 
 // messengerDelivery streams a turn to a Telegram/MAX/VK chat. It is the
@@ -20,13 +21,15 @@ import (
 // snapshots arrive, and on Final renders the answer (or error) and flushes it
 // to the chain. Nothing about its behaviour changed in the extraction.
 type messengerDelivery struct {
-	d            *daemon
-	ctx          context.Context // run context; /abort cancels it to unblock edits
-	chatID       string
-	replyTo      string
-	chatFmt      string
-	verbose      bool
-	hasTransport bool
+	d              *daemon
+	ctx            context.Context // run context; /abort cancels it to unblock edits
+	chatID         string
+	replyTo        string
+	chatFmt        string
+	verbose        bool
+	hasTransport   bool
+	sessionKey     string
+	sessionCreated int64
 
 	// chain is the progress/answer message chain. Only the worker mutates it
 	// until stopWorker() returns; Final reads it afterwards (no race).
@@ -49,16 +52,18 @@ func (d *daemon) newMessengerDelivery(ctx context.Context, msg queuedMsg, verbos
 	richMode := chatFmt == "rich"
 
 	m := &messengerDelivery{
-		d:            d,
-		ctx:          ctx,
-		chatID:       msg.chatID,
-		replyTo:      msg.msgID,
-		chatFmt:      chatFmt,
-		verbose:      verbose,
-		hasTransport: t != nil,
-		progressCh:   make(chan []runner.ProgressEvent, 1),
-		progressDone: make(chan struct{}),
-		workerDone:   make(chan struct{}),
+		d:              d,
+		ctx:            ctx,
+		chatID:         msg.chatID,
+		replyTo:        msg.msgID,
+		chatFmt:        chatFmt,
+		verbose:        verbose,
+		hasTransport:   t != nil,
+		sessionKey:     msg.sessKey,
+		sessionCreated: msg.sessCreated,
+		progressCh:     make(chan []runner.ProgressEvent, 1),
+		progressDone:   make(chan struct{}),
+		workerDone:     make(chan struct{}),
 	}
 
 	// Progress message — edit in place. If this message was queued and nothing
@@ -248,8 +253,32 @@ func (m *messengerDelivery) Final(res runner.RunResult) {
 		if _, err := d.syncFinalMessageChainChunks(m.chatID, m.replyTo, m.chain, finalChunks, m.chatFmt); err != nil {
 			log.Printf("final delivery failed: %v", err)
 		}
+		m.sendOutboundFiles(text)
 	}
 }
+
+func (m *messengerDelivery) sendOutboundFiles(answer string) {
+	t, rawChatID, _ := m.d.transportFor(m.chatID)
+	sender, ok := t.(transport.FileSender)
+	if !ok {
+		return
+	}
+	sess := m.d.store.Get(m.msgSessionKey(), m.msgSessionCreated())
+	if sess == nil {
+		return
+	}
+	for _, f := range outboundFiles(answer, sess.CWD) {
+		if err := sender.SendFile(rawChatID, f.name, f.contentType, f.data, "", m.replyTo); err != nil {
+			log.Printf("file delivery failed (%s): %v", f.name, err)
+		}
+	}
+}
+
+// These accessors are overridden by the delivery's bound message in the
+// constructor; kept as methods so file delivery cannot accidentally use the
+// current active session after /switch or /new.
+func (m *messengerDelivery) msgSessionKey() string    { return m.sessionKey }
+func (m *messengerDelivery) msgSessionCreated() int64 { return m.sessionCreated }
 
 func (m *messengerDelivery) Close() {
 	m.stopWorker()

@@ -603,6 +603,13 @@ func (d *daemon) handleCommand(chatID, msgID, text string) {
 			d.sendMessage(chatID, msgID, fmt.Sprintf("❌ %s", html.EscapeString(err.Error())))
 			return
 		}
+		if resolveSessionBackend(active, d.scopeDefaults(sk), d.cfg.GetDefaultBackend()) == "claude" {
+			if err := migrateClaudeTranscript(active.CWD, cwd, active.ID); err != nil {
+				log.Printf("claude transcript migration failed for %s: %v", active.ID, err)
+				d.sendMessage(chatID, msgID, "Не удалось перенести историю Claude для нового CWD.")
+				return
+			}
+		}
 		// Re-check Messages==0 atomically with the write: a message could have started
 		// and finished running between the snapshot check above and this call.
 		sess, ok := d.store.SetCWDIfMessages0(sk, active.Created, cwd)

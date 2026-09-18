@@ -1921,7 +1921,12 @@ func (d *daemon) ensureSession(sessionKey string) {
 }
 
 func (d *daemon) ensureSessionWithCWD(sessionKey, forceCWD string) {
-	if d.store.Active(sessionKey) != nil {
+	if sess := d.store.Active(sessionKey); sess != nil {
+		if forceCWD != "" && sess.CWD != forceCWD && resolveSessionBackend(sess, d.scopeDefaults(sessionKey), d.cfg.GetDefaultBackend()) == "claude" {
+			if err := migrateClaudeTranscript(sess.CWD, forceCWD, sess.ID); err != nil {
+				log.Printf("claude transcript migration failed for %s: %v", sess.ID, err)
+			}
+		}
 		return
 	}
 	cwd := d.scopeDefaults(sessionKey).CWD

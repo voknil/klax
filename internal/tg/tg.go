@@ -7,7 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -230,6 +233,58 @@ func (b *Bot) GetUpdates() ([]Update, error) {
 func (b *Bot) SendMessage(chatID, text, replyTo, format string) error {
 	_, err := b.sendMsg(chatID, text, replyTo, format)
 	return err
+}
+
+// SendFile uploads a local file as a Telegram document. Documents are used
+// for images too: this preserves the original bytes and works for arbitrary
+// agent-produced files without requiring a second photo-specific path.
+func (b *Bot) SendFile(chatID, name, contentType string, data []byte, caption, replyTo string) error {
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="document"; filename=%q`, filepath.Base(name)))
+	if contentType != "" {
+		h.Set("Content-Type", contentType)
+	}
+	part, err := mw.CreatePart(h)
+	if err != nil {
+		return err
+	}
+	if _, err = part.Write(data); err != nil {
+		return err
+	}
+	fields := map[string]string{"chat_id": chatID}
+	if caption != "" {
+		fields["caption"] = caption
+	}
+	if replyTo != "" {
+		if id, e := strconv.Atoi(replyTo); e == nil {
+			fields["reply_parameters"] = fmt.Sprintf(`{"message_id":%d}`, id)
+		}
+	}
+	for k, v := range fields {
+		if err := mw.WriteField(k, v); err != nil {
+			return err
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, apiBase+b.token+"/sendDocument", &body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		return &transport.APIError{Platform: "tg", Code: resp.StatusCode, Description: string(raw)}
+	}
+	return nil
 }
 
 func (b *Bot) SendMessageReturnID(chatID, text, replyTo, format string) (string, error) {

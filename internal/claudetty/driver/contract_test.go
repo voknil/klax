@@ -56,6 +56,11 @@ func TestEnsureClaudeContractMergesPreservingContent(t *testing.T) {
 	if err := os.WriteFile(p, []byte(src), 0644); err != nil {
 		t.Fatal(err)
 	}
+	// Make the intended existing mode explicit; the process umask may narrow
+	// the mode passed to WriteFile.
+	if err := os.Chmod(p, 0644); err != nil {
+		t.Fatal(err)
+	}
 	changed, err := ensureClaudeContract(p, "/home/u")
 	if err != nil {
 		t.Fatal(err)
