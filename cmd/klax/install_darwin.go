@@ -131,6 +131,7 @@ func runUninstall() {
 // Restart=always (so a drain-exit on update is relaunched with the new
 // binary); ThrottleInterval mirrors RestartSec=5.
 func renderLaunchAgent(binPath, pathEnv, logPath string) string {
+	home, _ := os.UserHomeDir()
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -151,6 +152,8 @@ func renderLaunchAgent(binPath, pathEnv, logPath string) string {
 	<integer>5</integer>
 	<key>EnvironmentVariables</key>
 	<dict>
+		<key>HOME</key>
+		<string>%s</string>
 		<key>PATH</key>
 		<string>%s</string>
 	</dict>
@@ -160,5 +163,5 @@ func renderLaunchAgent(binPath, pathEnv, logPath string) string {
 	<string>%s</string>
 </dict>
 </plist>
-`, launchdLabel, binPath, pathEnv, logPath, logPath)
+`, launchdLabel, binPath, home, pathEnv, logPath, logPath)
 }
