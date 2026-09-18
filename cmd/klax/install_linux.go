@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/PiDmitrius/klax/internal/pathutil"
 )
 
 func runInstall() {
@@ -23,7 +25,7 @@ func runInstall() {
 		fmt.Fprintf(os.Stderr, "cannot inspect current service unit: %v\n", err)
 		os.Exit(1)
 	} else if drifted {
-		fmt.Fprintf(os.Stderr, "warning: local systemd unit drift detected, overwriting %s\n", tildePath(unitPath))
+		fmt.Fprintf(os.Stderr, "warning: local systemd unit drift detected, overwriting %s\n", pathutil.TildePathsInText(unitPath))
 	}
 	if err := verifyServiceUnit(unit); err != nil {
 		if ignorableVerifyError(err) {
@@ -37,7 +39,7 @@ func runInstall() {
 		fmt.Fprintf(os.Stderr, "cannot install service unit: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("installed: %s\n", tildePath(unitPath))
+	fmt.Printf("installed: %s\n", pathutil.TildePathsInText(unitPath))
 
 	exec.Command("systemctl", "--user", "daemon-reload").Run()
 	exec.Command("systemctl", "--user", "enable", "klax").Run()
