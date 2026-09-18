@@ -203,6 +203,11 @@ func (d *daemon) applyUISessionSettingsCore(sk string, created int64, p uiSettin
 	if err != nil {
 		return err
 	}
+	if p.CWD != nil && backend == "claude" {
+		if err := migrateClaudeTranscript(sess.CWD, r.cwd, sess.ID); err != nil {
+			return &uiErr{http.StatusInternalServerError, "не удалось перенести историю Claude для нового CWD"}
+		}
+	}
 	// Re-check the cwd lock under the SAME lock as the mutation: a message could have
 	// started and finished running between the snapshot validated above and this call.
 	_, err = d.store.UpdateSessionChecked(sk, created,
