@@ -27,6 +27,9 @@ func TestIgnorableVerifyError(t *testing.T) {
 	if !ignorableVerifyError(fmt.Errorf("SO_PASSCRED failed: Operation not permitted")) {
 		t.Fatalf("expected sandbox verification error to be ignorable")
 	}
+	if !ignorableVerifyError(fmt.Errorf(systemdAnalyzeMissing)) {
+		t.Fatalf("expected a systemd-less environment (e.g. a container) to be ignorable, not fatal")
+	}
 	if ignorableVerifyError(fmt.Errorf("syntax error in unit")) {
 		t.Fatalf("real verification errors must stay fatal")
 	}

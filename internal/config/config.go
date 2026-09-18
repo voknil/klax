@@ -73,6 +73,13 @@ type Config struct {
 	// Global, toggled via /rich on|off. Telegram only; MAX/VK stay legacy.
 	TelegramRich bool `json:"tg_rich,omitempty"`
 
+	// OutboundFiles delivers files an answer links to as chat attachments
+	// (Telegram documents, MAX attachments). Absent or true = enabled; set it
+	// to false to keep messenger answers text-only. The web UI file links are
+	// unaffected — those are capability URLs, revocable and host-local, while
+	// a chat upload cannot be taken back, including in group chats.
+	OutboundFiles *bool `json:"outbound_files,omitempty"`
+
 	// UIListen is the address the web UI server binds to (e.g. "127.0.0.1:8799").
 	// Empty disables the UI. Access uses the user's management or viewing token.
 	UIListen string `json:"ui_listen,omitempty"`
@@ -99,6 +106,12 @@ func (c *Config) GetDefaultBackend() string {
 		return c.DefaultBackend
 	}
 	return "claude"
+}
+
+// FileDeliveryEnabled reports whether answers may push linked files into chats.
+// Unset means enabled.
+func (c *Config) FileDeliveryEnabled() bool {
+	return c.OutboundFiles == nil || *c.OutboundFiles
 }
 
 // GetUITitle returns the web UI product name, defaulting to "klax".

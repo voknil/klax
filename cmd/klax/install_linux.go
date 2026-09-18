@@ -91,9 +91,13 @@ WantedBy=default.target
 `, binPath)
 }
 
+// systemdAnalyzeMissing is one string shared by the check and by
+// ignorableVerifyError, so the two cannot drift apart again.
+const systemdAnalyzeMissing = "systemd-analyze not found"
+
 func verifyServiceUnit(unit string) error {
 	if _, err := exec.LookPath("systemd-analyze"); err != nil {
-		return fmt.Errorf("systemd-analyze not found")
+		return fmt.Errorf("%s", systemdAnalyzeMissing)
 	}
 
 	tmp, err := os.CreateTemp("", "klax-service-*.service")
@@ -126,5 +130,9 @@ func verifyServiceUnit(unit string) error {
 func ignorableVerifyError(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "Operation not permitted") ||
-		strings.Contains(msg, "SO_PASSCRED failed")
+		strings.Contains(msg, "SO_PASSCRED failed") ||
+		// No systemd at all (e.g. a container running via `klax start
+		// --foreground` under a different supervisor, like Docker's own
+		// restart policy) — nothing to verify against, not an error.
+		strings.Contains(msg, systemdAnalyzeMissing)
 }

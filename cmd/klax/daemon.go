@@ -1921,12 +1921,12 @@ func (d *daemon) ensureSession(sessionKey string) {
 }
 
 func (d *daemon) ensureSessionWithCWD(sessionKey, forceCWD string) {
+	// An existing session keeps its own CWD — forceCWD only seeds a new one
+	// (see TestEnsureSessionWithCWDPrefersScopeDefaultOverForceCWD). Nothing
+	// to migrate here: the transcript follows sess.CWD, which is what the run
+	// uses, and it is changed only through the settings path, which migrates
+	// under the same lock as the change.
 	if sess := d.store.Active(sessionKey); sess != nil {
-		if forceCWD != "" && sess.CWD != forceCWD && resolveSessionBackend(sess, d.scopeDefaults(sessionKey), d.cfg.GetDefaultBackend()) == "claude" {
-			if err := migrateClaudeTranscript(sess.CWD, forceCWD, sess.ID); err != nil {
-				log.Printf("claude transcript migration failed for %s: %v", sess.ID, err)
-			}
-		}
 		return
 	}
 	cwd := d.scopeDefaults(sessionKey).CWD

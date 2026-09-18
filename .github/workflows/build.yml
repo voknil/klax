@@ -29,3 +29,17 @@ jobs:
       - run: node --test cmd/klax/ui_static/*.test.mjs
 
       - run: for f in cmd/klax/ui_static/*.js; do node --check "$f"; done
+
+  # The darwin-only files (installer, launchd service, pty) are cross-compiled
+  # above but their tests only build on a mac, so they need a mac runner.
+  darwin:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - run: go vet ./...
+      - run: go test ./...

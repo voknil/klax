@@ -280,8 +280,33 @@ func (b *Bot) SendFile(chatID, name, contentType string, data []byte, caption, r
 		return err
 	}
 	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var result struct {
+		OK          bool `json:"ok"`
+		ErrorCode   int  `json:"error_code"`
+		Description string
+		Parameters  *struct {
+			RetryAfter int `json:"retry_after"`
+		} `json:"parameters"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		if resp.StatusCode != http.StatusOK {
+			return &transport.APIError{Platform: "tg", Code: resp.StatusCode, Description: string(raw)}
+		}
+		return fmt.Errorf("parse error: %v", err)
+	}
+	if !result.OK {
+		code := result.ErrorCode
+		if code == 0 {
+			code = resp.StatusCode
+		}
+		apiErr := &transport.APIError{Platform: "tg", Code: code, Description: result.Description}
+		if result.Parameters != nil {
+			apiErr.RetryAfter = result.Parameters.RetryAfter
+		}
+		return apiErr
+	}
 	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
 		return &transport.APIError{Platform: "tg", Code: resp.StatusCode, Description: string(raw)}
 	}
 	return nil

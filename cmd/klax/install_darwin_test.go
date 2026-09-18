@@ -29,6 +29,16 @@ func TestRenderLaunchAgentStructure(t *testing.T) {
 	}
 }
 
+func TestRenderLaunchAgentEscapesXMLText(t *testing.T) {
+	plist := renderLaunchAgent("/Users/a&b/.local/bin/klax", "/opt/homebrew/bin:/tmp/a&b", "/Users/a&b/Library/Logs/klax.log")
+
+	for _, want := range []string{"/Users/a&amp;b/.local/bin/klax", "/tmp/a&amp;b", "/Users/a&amp;b/Library/Logs/klax.log"} {
+		if !strings.Contains(plist, want) {
+			t.Fatalf("LaunchAgent plist missing escaped text %q:\n%s", want, plist)
+		}
+	}
+}
+
 func TestLaunchdPathEnvSeedsBackendDirs(t *testing.T) {
 	p := launchdPathEnv()
 	for _, dir := range []string{"/opt/homebrew/bin", "/usr/local/bin", "/.local/bin"} {

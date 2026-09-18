@@ -101,3 +101,19 @@ func TestSendFileUploadsDocumentAndReply(t *testing.T) {
 		t.Fatalf("SendFile: %v", err)
 	}
 }
+
+func TestSendFileReturnsTelegramEnvelopeError(t *testing.T) {
+	b := newTestBot(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":false,"error_code":400,"description":"Bad Request: invalid file"}`)
+	})
+
+	err := b.SendFile("123", "report.pdf", "application/pdf", []byte("payload"), "", "")
+	if err == nil {
+		t.Fatal("SendFile unexpectedly succeeded")
+	}
+	apiErr, ok := err.(*APIError)
+	if !ok || apiErr.Code != 400 || apiErr.Description == "" {
+		t.Fatalf("err = %#v, want Telegram APIError", err)
+	}
+}

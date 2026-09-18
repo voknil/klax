@@ -29,6 +29,7 @@ At a high level:
 - Persistent sessions with resume support
 - Per-session backend, model, thinking level, and sandbox mode
 - Group mode with a dedicated working directory per group chat
+- Files an answer links to are delivered into the chat as attachments
 - User service management: `systemd --user` on Linux, `launchd` LaunchAgent on macOS
 - Release update flow, plus local-source rebuilds via `source_dir`
 
@@ -111,9 +112,30 @@ Common fields:
 | `default_backend` | default backend for new sessions: `claude` or `codex` |
 | `source_dir` | local klax source tree used by `klax update` for local builds |
 | `users` | optional cross-platform identity mapping for shared DM sessions |
+| `outbound_files` | `false` disables file delivery into chats (default: enabled) |
 | `audit` | optional synchronous per-turn JSON audit hook |
 
 Runtime backend settings such as backend selection, model, thinking level, and sandbox mode are configured per session from chat via `/settings`.
+
+### Outbound file delivery
+
+When an answer links a local file (`[report](report.csv)`), klax uploads that
+file into the chat as an attachment — a Telegram document or a MAX attachment.
+Rules:
+
+- only files **below the session working directory** are eligible, resolved
+  through symlinks, same confinement as the web UI file links;
+- credential stores never leave the host: anything under `.git`, `.ssh`,
+  `.gnupg`, `.aws`, `.klax`, plus `.env*`, `.netrc`, `.npmrc`, `.pgpass`,
+  `credentials`, SSH keys, and `.pem/.key/.p12/.pfx/.jks/.keystore/.p8/.kdbx/.tfstate`;
+- at most 16 files per answer, 50 MB each, read and sent one at a time;
+- a failed upload is retried like any other send, and the chat is told which
+  file did not make it.
+
+Uploaded bytes cannot be revoked, and in a group chat every member gets them.
+Set `"outbound_files": false` in `config.json` to keep messenger answers
+text-only; the web UI keeps its own (revocable, host-local) file links either
+way.
 
 ### Turn audit hook
 

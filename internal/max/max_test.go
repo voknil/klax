@@ -32,8 +32,10 @@ func TestSendFileUploadsAndRetriesNotReady(t *testing.T) {
 			if r.URL.Query().Get("type") != "image" {
 				t.Errorf("upload type = %q, want image", r.URL.Query().Get("type"))
 			}
+			// An image upload URL comes without a token: MAX issues the
+			// attachment token only in the upload response below.
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"url":"`+apiBase+`/upload-data","token":"image-token"}`)
+			_, _ = io.WriteString(w, `{"url":"`+apiBase+`/upload-data"}`)
 		case "/upload-data":
 			if r.Method != http.MethodPost {
 				t.Errorf("upload method = %s", r.Method)
@@ -51,7 +53,8 @@ func TestSendFileUploadsAndRetriesNotReady(t *testing.T) {
 					t.Errorf("upload data = %q", data)
 				}
 			}
-			w.WriteHeader(http.StatusOK)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"photos":{"rend1":{"token":"image-token"}}}`)
 		case "/messages":
 			if r.Header.Get("Authorization") != "test-token" {
 				t.Errorf("Authorization = %q", r.Header.Get("Authorization"))
@@ -60,7 +63,9 @@ func TestSendFileUploadsAndRetriesNotReady(t *testing.T) {
 				t.Errorf("user_id = %q", r.URL.Query().Get("user_id"))
 			}
 			body, _ := io.ReadAll(r.Body)
-			if !strings.Contains(string(body), `"image-token"`) || !strings.Contains(string(body), `"mid-1"`) {
+			// An image attachment is addressed by the photos map, not a token.
+			if !strings.Contains(string(body), `"photos":{"rend1":{"token":"image-token"}}`) ||
+				!strings.Contains(string(body), `"mid-1"`) {
 				t.Errorf("message body = %s", body)
 			}
 			if messages.Add(1) == 1 {
@@ -105,5 +110,59 @@ func TestSendFileDoesNotRetryPermanentMessageError(t *testing.T) {
 	}
 	if got := messages.Load(); got != 1 {
 		t.Fatalf("message attempts = %d, want 1", got)
+	}
+}
+
+// A non-image upload keeps the old shape: the token comes from /uploads and the
+// attachment payload carries it directly.
+func TestSendFileUsesUploadsTokenForDocuments(t *testing.T) {
+	var body string
+	b := newTestBot(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/uploads":
+			if got := r.URL.Query().Get("type"); got != "file" {
+				t.Errorf("upload type = %q, want file", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"url":"`+apiBase+`/upload-data","token":"file-token"}`)
+		case "/upload-data":
+			w.WriteHeader(http.StatusOK) // empty body, as MAX answers for documents
+		case "/messages":
+			raw, _ := io.ReadAll(r.Body)
+			body = string(raw)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	if err := b.SendFile("42", "report.pdf", "application/pdf", []byte("pdf"), "", ""); err != nil {
+		t.Fatalf("SendFile: %v", err)
+	}
+	if !strings.Contains(body, `"type":"file"`) || !strings.Contains(body, `"token":"file-token"`) {
+		t.Fatalf("message body = %s", body)
+	}
+}
+
+// An upload response with neither token nor photos must say so, not send an
+// attachment with an empty token.
+func TestSendFileReportsMissingToken(t *testing.T) {
+	b := newTestBot(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/uploads":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"url":"`+apiBase+`/upload-data"}`)
+		case "/upload-data":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			t.Errorf("unexpected request to %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	})
+
+	err := b.SendFile("42", "chart.png", "image/png", []byte("png"), "", "")
+	if err == nil || !strings.Contains(err.Error(), "no token") {
+		t.Fatalf("SendFile error = %v, want a missing-token error", err)
 	}
 }

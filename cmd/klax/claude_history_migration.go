@@ -19,6 +19,9 @@ func migrateClaudeTranscript(oldCWD, newCWD, sessionID string) error {
 	}
 	srcFile := filepath.Join(claudeProjectDir(base, oldCWD), sessionID+".jsonl")
 	if _, err := os.Stat(srcFile); err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
 		found, findErr := findClaudeTranscript(base, sessionID)
 		if findErr != nil {
 			return findErr
@@ -83,6 +86,9 @@ func findClaudeTranscript(base, sessionID string) (string, error) {
 		}
 		return nil
 	})
+	if os.IsNotExist(err) {
+		return "", nil
+	}
 	return found, err
 }
 

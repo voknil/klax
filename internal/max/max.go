@@ -248,6 +248,21 @@ func (b *Bot) SendMessageReturnID(chatID, text, replyTo, format string) (string,
 	return b.sendMsg(chatID, text, replyTo, format)
 }
 
+// truncate shortens a body quoted in an error message.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
+// photoToken is one rendition of an uploaded image: MAX returns a map of them
+// instead of a single token, and expects the same map back as the attachment
+// payload.
+type photoToken struct {
+	Token string `json:"token"`
+}
+
 // SendFile uploads a local file and sends it as a MAX attachment. MAX requires
 // a type-specific upload URL before the attachment token can be used in a
 // message.
@@ -313,20 +328,38 @@ func (b *Bot) SendFile(chatID, name, contentType string, data []byte, caption, r
 		raw, _ := io.ReadAll(uploadResp.Body)
 		return httpError(uploadResp.StatusCode, "upload: "+string(raw))
 	}
+	// Where the attachment token comes from depends on the type: file/video/audio
+	// carry it in the /uploads response, images do not — theirs arrives in the
+	// upload response, keyed per rendition under "photos". Both shapes are read,
+	// in that order, so neither type depends on the other's behaviour.
+	var photos map[string]photoToken
 	if upload.Token == "" {
-		var result struct {
-			Token string `json:"token"`
-		}
-		if err := json.NewDecoder(uploadResp.Body).Decode(&result); err != nil {
+		raw, err := io.ReadAll(uploadResp.Body)
+		if err != nil {
 			return err
 		}
+		var result struct {
+			Token  string                `json:"token"`
+			Photos map[string]photoToken `json:"photos"`
+		}
+		if err := json.Unmarshal(raw, &result); err != nil {
+			// Keep the body in the error: this is the one response shape that
+			// differs per attachment type, so a surprise must be readable.
+			return fmt.Errorf("MAX upload response is not JSON (%q): %w", truncate(string(raw), 200), err)
+		}
 		upload.Token = result.Token
+		photos = result.Photos
 	}
-	if upload.Token == "" {
+	if upload.Token == "" && len(photos) == 0 {
 		return fmt.Errorf("MAX upload response has no token")
 	}
 
+	// An image attachment is addressed by its photos map; every other type by
+	// its token.
 	payload := map[string]interface{}{"token": upload.Token}
+	if upload.Token == "" {
+		payload = map[string]interface{}{"photos": photos}
+	}
 	message := map[string]interface{}{
 		"attachments": []interface{}{map[string]interface{}{"type": typ, "payload": payload}},
 	}

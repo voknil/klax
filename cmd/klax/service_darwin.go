@@ -27,19 +27,45 @@ func runServiceStart() {
 }
 
 func runServiceCtl(action string) {
-	var cmd *exec.Cmd
 	switch action {
 	case "stop":
 		// bootout unloads so KeepAlive does not relaunch — matches `systemctl stop`.
-		cmd = exec.Command("launchctl", "bootout", launchdTarget())
+		runPassthrough(exec.Command("launchctl", "bootout", launchdTarget()))
 	case "restart":
-		// SIGTERM lets the daemon drain in-flight work (its signal handler
-		// turns it into a graceful drain); KeepAlive then relaunches it. This
-		// matches `systemctl --user restart`, which also sends SIGTERM.
-		cmd = exec.Command("launchctl", "kill", "SIGTERM", launchdTarget())
+		runServiceRestart()
 	default:
-		cmd = exec.Command("launchctl", action, launchdTarget())
+		runPassthrough(exec.Command("launchctl", action, launchdTarget()))
 	}
+}
+
+// runServiceRestart restarts the agent the way `systemctl --user restart` does:
+// it also starts one that is currently stopped. SIGTERM alone only works while
+// the job is loaded — after `klax stop` (bootout) it fails, which used to leave
+// the daemon silently down.
+func runServiceRestart() {
+	// SIGTERM lets the daemon drain in-flight work (its signal handler turns it
+	// into a graceful drain); KeepAlive then relaunches it.
+	if err := exec.Command("launchctl", "kill", "SIGTERM", launchdTarget()).Run(); err == nil {
+		fmt.Println("klax restarted")
+		return
+	}
+	// Not loaded (or not running): load the plist and make sure it is up.
+	if _, err := os.Stat(launchAgentPath()); err != nil {
+		fmt.Fprintf(os.Stderr, "failed: LaunchAgent not installed\nTry 'klax install' first, or 'klax start --foreground'\n")
+		os.Exit(1)
+	}
+	exec.Command("launchctl", "bootstrap", launchdDomain(), launchAgentPath()).Run()
+	cmd := exec.Command("launchctl", "kickstart", launchdTarget())
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed: %v\nTry 'klax start --foreground'\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("klax restarted")
+}
+
+func runPassthrough(cmd *exec.Cmd) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Run()

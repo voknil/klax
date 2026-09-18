@@ -258,6 +258,9 @@ func (m *messengerDelivery) Final(res runner.RunResult) {
 }
 
 func (m *messengerDelivery) sendOutboundFiles(answer string) {
+	if !m.d.outboundFilesEnabled() {
+		return
+	}
 	t, rawChatID, _ := m.d.transportFor(m.chatID)
 	sender, ok := t.(transport.FileSender)
 	if !ok {
@@ -267,10 +270,30 @@ func (m *messengerDelivery) sendOutboundFiles(answer string) {
 	if sess == nil {
 		return
 	}
-	for _, f := range outboundFiles(answer, sess.CWD) {
-		if err := sender.SendFile(rawChatID, f.name, f.contentType, f.data, "", m.replyTo); err != nil {
-			log.Printf("file delivery failed (%s): %v", f.name, err)
+	var failed []string
+	for _, ref := range outboundFileRefs(answer, sess.CWD) {
+		// One file is in memory at a time: read it, send it, drop it.
+		contentType, data, err := ref.load()
+		if err != nil {
+			log.Printf("file delivery skipped (%s): %v", ref.name, err)
+			failed = append(failed, ref.name)
+			continue
 		}
+		// Same retry policy as every other send: a 429 on sendDocument is
+		// routine when an answer carries several files, and dropping the
+		// attachment silently leaves the user with a link to nothing.
+		err = retryDo(m.ctx, func() error {
+			return sender.SendFile(rawChatID, ref.name, contentType, data, "", m.replyTo)
+		})
+		if err != nil {
+			log.Printf("file delivery failed (%s): %v", ref.name, err)
+			if m.ctx.Err() == nil { // /abort is the user's own doing, not a failure to report
+				failed = append(failed, ref.name)
+			}
+		}
+	}
+	if len(failed) > 0 {
+		m.d.sendMessage(m.chatID, m.replyTo, "⚠️ не удалось отправить файлом: "+strings.Join(failed, ", "))
 	}
 }
 

@@ -30,56 +30,82 @@ const maxOutboundFileSize = 50 << 20
 
 var blockedOutboundExtensions = map[string]bool{
 	".key": true, ".pem": true, ".p12": true, ".pfx": true,
-	".jks": true, ".keystore": true,
+	".jks": true, ".keystore": true, ".p8": true, ".kdbx": true,
+	".tfstate": true,
 }
 
-// outboundFiles returns local files referenced by an agent answer. The same
+// blockedOutboundNames are files whose whole purpose is to hold credentials.
+// Unlike the UI, a chat upload cannot be revoked, so these never leave the host
+// even when the agent links them deliberately.
+var blockedOutboundNames = map[string]bool{
+	"id_rsa": true, "id_ecdsa": true, "id_ed25519": true,
+	"authorized_keys": true, "known_hosts": true,
+	".netrc": true, ".npmrc": true, ".pgpass": true, "credentials": true,
+}
+
+// blockedOutboundDirs are path components that disqualify everything below them.
+var blockedOutboundDirs = map[string]bool{
+	".git": true, ".ssh": true, ".gnupg": true, ".aws": true, ".klax": true,
+}
+
+// outboundFileRef is one publishable local file. Only the path travels through
+// the collection pass — the bytes are read one file at a time at send time, so
+// a burst of large attachments cannot hold maxOutboundFiles × maxOutboundFileSize
+// in memory at once.
+type outboundFileRef struct {
+	path string // symlink-resolved absolute path
+	name string // filename as it appears in the chat
+}
+
+// outboundFilesEnabled reports whether this daemon may upload answer-linked
+// files to messengers. An absent config means the default: enabled.
+func (d *daemon) outboundFilesEnabled() bool {
+	return d.cfg == nil || d.cfg.FileDeliveryEnabled()
+}
+
+// outboundFileRefs returns local files referenced by an agent answer. The same
 // confinement rule as the web UI is used: only existing files below the
 // session working directory are eligible for upload.
-func outboundFiles(md, cwd string) []struct {
-	name, contentType string
-	data              []byte
-} {
+func outboundFileRefs(md, cwd string) []outboundFileRef {
 	if md == "" || cwd == "" || !strings.Contains(md, "](") {
 		return nil
 	}
 	seen := make(map[string]bool)
-	var out []struct {
-		name, contentType string
-		data              []byte
-	}
-	outLinkRe.ReplaceAllStringFunc(md, func(m string) string {
+	var out []outboundFileRef
+	for _, m := range outLinkRe.FindAllStringSubmatch(md, -1) {
 		if len(out) >= maxOutboundFiles {
-			return m
+			break
 		}
-		sub := outLinkRe.FindStringSubmatch(m)
-		href := sub[3]
+		href := m[3]
 		if isRemoteHref(href) {
-			return m
+			continue
 		}
 		real, ok := resolveInRoot(href, cwd, []string{cwd})
-		if !ok || seen[real] {
-			return m
+		if !ok || seen[real] || !outboundFileAllowed(real) {
+			continue
 		}
-		if !outboundFileAllowed(real) {
-			return m
-		}
-		data, err := readOutboundFile(real)
-		if err != nil {
-			return m
+		// Cheap pre-filter so an oversized or empty file is skipped before it is
+		// opened; readOutboundFile re-checks, which is what actually holds.
+		if st, err := os.Stat(real); err != nil || !st.Mode().IsRegular() || st.Size() <= 0 || st.Size() > maxOutboundFileSize {
+			continue
 		}
 		seen[real] = true
-		ct := mime.TypeByExtension(filepath.Ext(real))
-		if ct == "" {
-			ct = http.DetectContentType(data)
-		}
-		out = append(out, struct {
-			name, contentType string
-			data              []byte
-		}{sanitizeAttachmentFilename(filepath.Base(real)), ct, data})
-		return m
-	})
+		out = append(out, outboundFileRef{path: real, name: sanitizeAttachmentFilename(filepath.Base(real))})
+	}
 	return out
+}
+
+// load reads one file's bytes and decides its content type.
+func (r outboundFileRef) load() (contentType string, data []byte, err error) {
+	data, err = readOutboundFile(r.path)
+	if err != nil {
+		return "", nil, err
+	}
+	ct := mime.TypeByExtension(filepath.Ext(r.path))
+	if ct == "" {
+		ct = http.DetectContentType(data)
+	}
+	return ct, data, nil
 }
 
 // readOutboundFile re-checks the size while reading. A stat-then-ReadFile
@@ -113,14 +139,14 @@ func readOutboundFile(path string) ([]byte, error) {
 // UI has its own capability controls; messenger uploads need this additional
 // guard because the bytes leave the host and cannot be revoked afterwards.
 func outboundFileAllowed(path string) bool {
-	for _, part := range strings.Split(filepath.Clean(path), string(filepath.Separator)) {
-		lower := strings.ToLower(part)
-		if lower == ".git" || lower == ".ssh" {
+	clean := filepath.Clean(path)
+	for _, part := range strings.Split(clean, string(filepath.Separator)) {
+		if blockedOutboundDirs[strings.ToLower(part)] {
 			return false
 		}
 	}
-	base := strings.ToLower(filepath.Base(path))
-	if base == ".env" || strings.HasPrefix(base, ".env.") || base == "id_rsa" || base == "id_ed25519" || base == "authorized_keys" || base == "known_hosts" {
+	base := strings.ToLower(filepath.Base(clean))
+	if base == ".env" || strings.HasPrefix(base, ".env.") || blockedOutboundNames[base] {
 		return false
 	}
 	return !blockedOutboundExtensions[strings.ToLower(filepath.Ext(base))]

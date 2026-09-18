@@ -3,6 +3,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/xml"
 	"fmt"
 	"log"
 	"os"
@@ -163,5 +165,13 @@ func renderLaunchAgent(binPath, pathEnv, logPath string) string {
 	<string>%s</string>
 </dict>
 </plist>
-`, launchdLabel, binPath, home, pathEnv, logPath, logPath)
+`, plistText(launchdLabel), plistText(binPath), plistText(home), plistText(pathEnv), plistText(logPath), plistText(logPath))
+}
+
+func plistText(s string) string {
+	var b bytes.Buffer
+	if err := xml.EscapeText(&b, []byte(s)); err != nil {
+		return s
+	}
+	return b.String()
 }

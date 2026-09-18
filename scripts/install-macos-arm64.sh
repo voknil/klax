@@ -2,10 +2,13 @@
 set -euo pipefail
 
 # Build and install klax for Apple Silicon, then load its per-user LaunchAgent.
-# The default target is intentionally explicit for Roman's macOS host.
+# The target is the invoking user unless KLAX_USER/KLAX_HOME say otherwise.
 
-TARGET_USER="${KLAX_USER:-roman}"
-TARGET_HOME="${KLAX_HOME:-/Users/roman}"
+TARGET_USER="${KLAX_USER:-$(id -un)}"
+# The script refuses to run as anyone but TARGET_USER (see below), so the
+# invoking user's own home is the right default — never a hard-coded path that
+# a KLAX_USER-only override would silently install into.
+TARGET_HOME="${KLAX_HOME:-$HOME}"
 INSTALL_DIR="${KLAX_INSTALL_DIR:-${TARGET_HOME}/.local/bin}"
 PLIST_PATH="${TARGET_HOME}/Library/LaunchAgents/klax.plist"
 LABEL="klax"
@@ -70,7 +73,7 @@ install() {
     require_commands go plutil launchctl mktemp mv mkdir cp chmod date cmp
     [ -f "go.mod" ] || fail "run this script from the klax repository root"
 
-    local binary_tmp plist_tmp backup
+    local binary_tmp plist_tmp backup build_dir
     build_dir="$(mktemp -d "${TMPDIR:-/tmp}/klax-build.XXXXXX")"
     # The directory is an explicitly-created temporary path, and is cleaned up
     # even when the build or plist validation fails.
