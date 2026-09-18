@@ -448,6 +448,11 @@ klax restart                           # kill and relaunch
 
 Common causes: invalid bot token, network unreachable at startup, broken config. Check `~/.config/klax/config.json` and re-run `klax setup` if needed.
 
+For a reproducible Apple Silicon build/install with explicit `HOME` and safe
+`launchctl` restart/status commands, see
+[`docs/macos-install.md`](docs/macos-install.md) and
+[`scripts/install-macos-arm64.sh`](scripts/install-macos-arm64.sh).
+
 ## Contract
 
 The invariants that span more than one file — what owns a turn's state, where a failure's reason
