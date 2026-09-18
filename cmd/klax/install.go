@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/PiDmitrius/klax/internal/pathutil"
 )
 
 // installBinary copies the running executable to ~/.local/bin/klax and returns
@@ -25,7 +27,7 @@ func installBinary() string {
 		fmt.Fprintf(os.Stderr, "cannot install: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("installed: %s\n", tildePath(dst))
+	fmt.Printf("installed: %s\n", pathutil.TildePathsInText(dst))
 	return dst
 }
 

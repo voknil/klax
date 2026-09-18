@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/PiDmitrius/klax/internal/pathutil"
 )
 
 // launchdLabel is the launchd service label and the basename of the plist.
@@ -67,13 +69,13 @@ func runInstall() {
 		fmt.Fprintf(os.Stderr, "cannot inspect current LaunchAgent: %v\n", err)
 		os.Exit(1)
 	} else if drifted {
-		fmt.Fprintf(os.Stderr, "warning: local LaunchAgent drift detected, overwriting %s\n", tildePath(plistPath))
+		fmt.Fprintf(os.Stderr, "warning: local LaunchAgent drift detected, overwriting %s\n", pathutil.TildePathsInText(plistPath))
 	}
 	if err := os.WriteFile(plistPath, []byte(plist), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "cannot install LaunchAgent: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("installed: %s\n", tildePath(plistPath))
+	fmt.Printf("installed: %s\n", pathutil.TildePathsInText(plistPath))
 
 	// Write restart marker if not already present (update writes it before build).
 	if readMarker() == nil {
