@@ -50,10 +50,55 @@ UID_VALUE="$(id -u "$TARGET_USER")"
 DOMAIN="gui/${UID_VALUE}"
 TARGET="${DOMAIN}/${LABEL}"
 
+# launchd can briefly return an I/O error while it is stopping a replaced
+# LaunchAgent. Keep the retry window bounded, but long enough for the old
+# process and launchd's job state to settle. The overrides make this behavior
+# quick to exercise in shell tests without changing the normal defaults.
+LAUNCHCTL_SETTLE_ATTEMPTS="${KLAX_LAUNCHCTL_SETTLE_ATTEMPTS:-10}"
+LAUNCHCTL_SETTLE_DELAY="${KLAX_LAUNCHCTL_SETTLE_DELAY:-1}"
+
 require_commands() {
     local command_name
     for command_name in "$@"; do
         command -v "$command_name" >/dev/null || fail "required command not found: $command_name"
+    done
+}
+
+launchd_loaded() {
+    launchctl print "$TARGET" >/dev/null 2>&1
+}
+
+reload_launchagent() {
+    local attempt bootstrap_output
+
+    # A bootout can return macOS' I/O error while the old process is still
+    # exiting. Retry until the job is verifiably absent; an already-unloaded
+    # job is the desired idempotent result.
+    for ((attempt = 1; attempt <= LAUNCHCTL_SETTLE_ATTEMPTS; attempt++)); do
+        launchctl bootout "$TARGET" >/dev/null 2>&1 || true
+        if ! launchd_loaded; then
+            break
+        fi
+        if [ "$attempt" -eq "$LAUNCHCTL_SETTLE_ATTEMPTS" ]; then
+            fail "could not unload $TARGET while replacing LaunchAgent"
+        fi
+        sleep "$LAUNCHCTL_SETTLE_DELAY"
+    done
+
+    # bootstrap can likewise report an I/O error during the transition. A
+    # successful print is authoritative, including when bootstrap itself
+    # returned an already-loaded/transient error.
+    for ((attempt = 1; attempt <= LAUNCHCTL_SETTLE_ATTEMPTS; attempt++)); do
+        bootstrap_output="$(launchctl bootstrap "$DOMAIN" "$PLIST_PATH" 2>&1)" || true
+        if launchd_loaded; then
+            return 0
+        fi
+        if [ "$attempt" -lt "$LAUNCHCTL_SETTLE_ATTEMPTS" ]; then
+            sleep "$LAUNCHCTL_SETTLE_DELAY"
+        else
+            printf '%s\n' "$bootstrap_output" >&2
+            fail "could not load $TARGET after retries"
+        fi
     done
 }
 
@@ -70,14 +115,14 @@ restart() {
 }
 
 install() {
-    require_commands go plutil launchctl mktemp mv mkdir cp chmod date cmp
+    require_commands go plutil launchctl mktemp mv mkdir cp chmod date cmp sleep
     [ -f "go.mod" ] || fail "run this script from the klax repository root"
 
     local binary_tmp plist_tmp backup build_dir
     build_dir="$(mktemp -d "${TMPDIR:-/tmp}/klax-build.XXXXXX")"
     # The directory is an explicitly-created temporary path, and is cleaned up
     # even when the build or plist validation fails.
-    trap 'rm -rf -- "$build_dir"' EXIT
+    trap 'if [ -n "${build_dir:-}" ]; then rm -rf -- "$build_dir"; fi' EXIT
 
     printf 'building klax for darwin/arm64...\n'
     GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -o "${build_dir}/klax" ./cmd/klax
@@ -119,8 +164,7 @@ EOF
     fi
     mv -f "$plist_tmp" "$PLIST_PATH"
 
-    launchctl bootout "$TARGET" 2>/dev/null || true
-    launchctl bootstrap "$DOMAIN" "$PLIST_PATH"
+    reload_launchagent
     printf 'installed %s and loaded %s\n' "${INSTALL_DIR}/klax" "$TARGET"
 }
 

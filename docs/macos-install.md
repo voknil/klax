@@ -20,6 +20,11 @@ The script performs these checks before loading the service:
 - the generated plist passes `plutil -lint`;
 - an existing, different plist is backed up beside itself before replacement.
 
+When replacing an existing agent, the wrapper retries `bootout` while the old
+job settles, then retries `bootstrap` after each state check. It only reports
+success after `launchctl print gui/<uid>/klax` confirms the replacement is
+loaded, which handles transient macOS I/O errors from launchd.
+
 The LaunchAgent sets `HOME=/Users/roman`, uses a predictable PATH for
 Homebrew and `~/.local/bin`, starts at login, and keeps the daemon alive. Its
 combined stdout/stderr log is `/Users/roman/Library/Logs/klax.log`.
