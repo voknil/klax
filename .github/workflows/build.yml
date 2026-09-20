@@ -43,3 +43,7 @@ jobs:
 
       - run: go vet ./...
       - run: go test ./...
+
+      # The install wrapper runs against mocked launchctl/go/plutil, so it
+      # never touches the runner's own launchd domain.
+      - run: bash scripts/install-macos-arm64_test.sh

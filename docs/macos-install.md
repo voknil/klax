@@ -23,9 +23,13 @@ The script performs these checks before loading the service:
 When replacing an existing agent, the wrapper retries `bootout` while the old
 job settles, then retries `bootstrap` after each state check. It only reports
 success after `launchctl print gui/<uid>/klax` confirms the replacement is
-loaded, which handles transient macOS I/O errors from launchd.
+loaded, which handles transient macOS I/O errors from launchd. The retry budget
+(`KLAX_LAUNCHCTL_SETTLE_ATTEMPTS`, default 10, and `KLAX_LAUNCHCTL_SETTLE_DELAY`,
+default 1s) is validated up front: a zero or non-numeric value is rejected
+rather than silently skipping the reload.
 
-The LaunchAgent sets `HOME=/Users/roman`, uses a predictable PATH for
+The LaunchAgent sets `HOME` to the installing user's home (`/Users/roman`
+here; override with `KLAX_HOME`), uses a predictable PATH for
 Homebrew and `~/.local/bin`, starts at login, and keeps the daemon alive. Its
 combined stdout/stderr log is `/Users/roman/Library/Logs/klax.log`.
 

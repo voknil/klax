@@ -57,6 +57,16 @@ TARGET="${DOMAIN}/${LABEL}"
 LAUNCHCTL_SETTLE_ATTEMPTS="${KLAX_LAUNCHCTL_SETTLE_ATTEMPTS:-10}"
 LAUNCHCTL_SETTLE_DELAY="${KLAX_LAUNCHCTL_SETTLE_DELAY:-1}"
 
+# A zero or non-numeric budget would make both retry loops run zero iterations,
+# so the script would report a replacement it never performed.
+case "$LAUNCHCTL_SETTLE_ATTEMPTS" in
+    ''|*[!0-9]*) fail "KLAX_LAUNCHCTL_SETTLE_ATTEMPTS must be a positive integer" ;;
+esac
+[ "$LAUNCHCTL_SETTLE_ATTEMPTS" -ge 1 ] || fail "KLAX_LAUNCHCTL_SETTLE_ATTEMPTS must be at least 1"
+case "$LAUNCHCTL_SETTLE_DELAY" in
+    ''|*[!0-9.]*) fail "KLAX_LAUNCHCTL_SETTLE_DELAY must be a non-negative number" ;;
+esac
+
 require_commands() {
     local command_name
     for command_name in "$@"; do
@@ -118,11 +128,14 @@ install() {
     require_commands go plutil launchctl mktemp mv mkdir cp chmod date cmp sleep
     [ -f "go.mod" ] || fail "run this script from the klax repository root"
 
-    local binary_tmp plist_tmp backup build_dir
+    local binary_tmp plist_tmp backup
+    # build_dir stays global on purpose: the EXIT trap fires after install()
+    # has returned, where a local would already be out of scope — leaving the
+    # directory (and the 15 MB binary in it) behind on every run.
     build_dir="$(mktemp -d "${TMPDIR:-/tmp}/klax-build.XXXXXX")"
     # The directory is an explicitly-created temporary path, and is cleaned up
     # even when the build or plist validation fails.
-    trap 'if [ -n "${build_dir:-}" ]; then rm -rf -- "$build_dir"; fi' EXIT
+    trap 'rm -rf -- "${build_dir:-}"' EXIT
 
     printf 'building klax for darwin/arm64...\n'
     GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -o "${build_dir}/klax" ./cmd/klax
