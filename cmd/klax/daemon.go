@@ -1037,6 +1037,12 @@ func (d *daemon) watchMarker() {
 // reported only once the message is actually going to be accepted, mirroring
 // each platform's previous inline behaviour.
 func (d *daemon) dispatchInbound(chatID, msgID, text string, attachments []attachment, attachErrs []string, allowed bool, origin inbound.Origin) {
+	// Every inbound gate decision is logged — allowed or not. A denial that
+	// left no trace is exactly what made a real unauthorized-access incident
+	// unprovable from the log alone; this line is the fix for that gap, not
+	// just for this one investigation.
+	log.Printf("inbound gate: transport=%s chatID=%s senderID=%s senderUsername=%q senderName=%q allowed=%v group=%v",
+		origin.Transport, chatID, origin.Sender.ID, origin.Sender.Username, origin.Sender.DisplayName, allowed, d.isGroupChat(chatID))
 	notifyAttachErrs := func() {
 		if len(attachErrs) > 0 {
 			d.sendPlain(chatID, msgID, "Не удалось скачать:\n• "+strings.Join(attachErrs, "\n• "))
