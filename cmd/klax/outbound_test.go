@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -274,6 +275,29 @@ func TestOutboundFilesRejectsOutsideRootAndRemoteLinks(t *testing.T) {
 	md := "[outside](" + filepath.Join(outside, "secret.txt") + ") [web](https://example.test/a) [anchor](#x)"
 	if got := outboundFileRefs(md, cwd); len(got) != 0 {
 		t.Fatalf("outboundFileRefs returned files for unsafe links: %#v", got)
+	}
+}
+
+// Codex answers link their own output as "sandbox:/abs/path" — a convention,
+// not a real URI scheme. Reproduces the exact link Irina's session emitted:
+// non-ASCII filename, spaces, url-escaped. Claude never uses this prefix, so
+// this path is codex-only.
+func TestOutboundFilesResolvesCodexSandboxLinks(t *testing.T) {
+	cwd := t.TempDir()
+	name := "УМК к лекции 6. Ароматные воды и сиропы.docx"
+	if err := os.WriteFile(filepath.Join(cwd, name), []byte("docx"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// codex escapes only the filename segment, keeping path separators intact.
+	href := "sandbox:" + cwd + "/" + url.PathEscape(name)
+	md := "[Скачать файл Word](" + href + ")"
+
+	got := outboundFileRefs(md, cwd)
+	if len(got) != 1 {
+		t.Fatalf("outboundFileRefs did not resolve the sandbox: link: %#v (href=%q)", got, href)
+	}
+	if got[0].name != name {
+		t.Fatalf("resolved name = %q, want %q", got[0].name, name)
 	}
 }
 

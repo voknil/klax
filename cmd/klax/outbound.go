@@ -261,6 +261,17 @@ func outboundPath(href, cwd string) (string, bool) {
 	if err != nil {
 		dec = href
 	}
+	// Codex links files inside its own sandbox as "sandbox:/abs/path" — its own
+	// convention, not a real URI scheme. Left unstripped, "sandbox:/..." fails
+	// filepath.IsAbs (it doesn't start with "/"), gets joined onto cwd into a
+	// path that never exists, and the link is silently dropped: Claude never
+	// emits this prefix, so only codex-backed sessions hit it. Compare only the
+	// ASCII prefix itself (not a lowered copy of the whole string) so a non-ASCII
+	// filename after it can't shift the byte offset used to strip the prefix.
+	const sandboxPrefix = "sandbox:"
+	if len(dec) >= len(sandboxPrefix) && strings.EqualFold(dec[:len(sandboxPrefix)], sandboxPrefix) {
+		dec = dec[len(sandboxPrefix):]
+	}
 	if strings.HasPrefix(dec, "~") || strings.HasPrefix(strings.ToLower(dec), "file:") {
 		return "", false
 	}
