@@ -28,7 +28,7 @@ func TestEnqueueToSessionRejectsMissingTarget(t *testing.T) {
 	d.store = newStoreWithChat("tg:1", "one")
 	d.runners = make(map[runnerKey]*sessionRunner)
 
-	d.enqueueToSession("tg:1", "100", "hi", nil, 99999, "")
+	d.enqueueToSession("tg:1", "100", "hi", nil, "s99999", "")
 
 	if len(d.runners) != 0 {
 		t.Fatalf("missing target must not create a runner, got %d", len(d.runners))
@@ -52,37 +52,35 @@ func TestEnqueueToSessionBindsExplicitTarget(t *testing.T) {
 	d.store = newStoreWithChat("tg:1", "active", "other")
 	d.runners = make(map[runnerKey]*sessionRunner)
 
-	var targetCreated, activeCreated int64
+	var targetKlaxID, activeKlaxID string
 	for _, s := range d.store.SessionsFor("tg:1") {
 		if s.Active {
-			activeCreated = s.Created
+			activeKlaxID = s.KlaxID
 		} else {
-			targetCreated = s.Created
+			targetKlaxID = s.KlaxID
 		}
 	}
-	if targetCreated == 0 || activeCreated == 0 || targetCreated == activeCreated {
-		t.Fatalf("setup: need a distinct active/target pair, got active=%d target=%d", activeCreated, targetCreated)
+	if targetKlaxID == "" || activeKlaxID == "" || targetKlaxID == activeKlaxID {
+		t.Fatalf("setup: need a distinct active/target pair, got active=%s target=%s", activeKlaxID, targetKlaxID)
 	}
 
 	sr := &sessionRunner{runner: runner.New(), processing: true}
-	d.runners[runnerKey{sk: "tg:1", created: targetCreated}] = sr
+	d.runners[runnerKey{sk: "tg:1", klaxID: targetKlaxID}] = sr
 
-	d.enqueueToSession("tg:1", "100", "hi", nil, targetCreated, "")
+	d.enqueueToSession("tg:1", "100", "hi", nil, targetKlaxID, "")
 
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 	if len(sr.queue) != 1 {
 		t.Fatalf("expected 1 queued message on the target runner, got %d", len(sr.queue))
 	}
-	if sr.queue[0].sessCreated != targetCreated {
-		t.Fatalf("message bound to %d, want explicit target %d (not active %d)", sr.queue[0].sessCreated, targetCreated, activeCreated)
+	if sr.queue[0].klaxID != targetKlaxID {
+		t.Fatalf("message bound to %s, want explicit target %s (not active %s)", sr.queue[0].klaxID, targetKlaxID, activeKlaxID)
 	}
 }
 
-// A messenger DM (no nonce) is echoed to the UI hub as a "user" event the instant
-// it is accepted, so it shows up live in the web UI — not only on a reload.
-// A mapped messenger DM lands in the durable log; the read model (the tail's source, not a live
-// echo event) renders it as the user's bubble with the original text.
+// A mapped messenger DM lands in the durable log; the read model (the live channel's source)
+// renders it as the user's bubble with the original text.
 func TestEnqueueToSessionRendersMessengerDMInReadModel(t *testing.T) {
 	t.Setenv("KLAX_DATA_DIR", t.TempDir())
 	tp := &fakeTransport{}
@@ -93,15 +91,16 @@ func TestEnqueueToSessionRendersMessengerDMInReadModel(t *testing.T) {
 	d.uiHub = newUIHub()
 
 	sess := d.store.SessionsFor("user:alice")[0]
-	created := sess.Created
+	klaxID := sess.KlaxID
 	// Pre-seed the runner as processing so the spawned queue pump returns at its
 	// guard and no real backend runs.
-	d.runners[runnerKey{sk: "user:alice", created: created}] = &sessionRunner{runner: runner.New(), processing: true}
+	d.runners[runnerKey{sk: "user:alice", klaxID: klaxID}] = &sessionRunner{runner: runner.New(), processing: true}
 
-	d.enqueueToSession("tg:1", "100", "hi there", nil, created, "") // mapped messenger DM: no nonce
+	d.enqueueToSession("tg:1", "100", "hi there", nil, klaxID, "") // mapped messenger DM: no nonce
 
 	found := false
-	for _, ut := range d.readModel("user:alice", sess) {
+	rows, _, _ := d.readModelBuild("user:alice", sess)
+	for _, ut := range rows {
 		if ut.Role == "user" && ut.Text == "hi there" {
 			found = true
 		}
@@ -111,8 +110,8 @@ func TestEnqueueToSessionRendersMessengerDMInReadModel(t *testing.T) {
 	}
 }
 
-// An inbound image the user sends lands in the durable log and the read model (the tail's source,
-// not a live echo event) renders it as a markdown image — never the 📎 file fallback.
+// An inbound image the user sends lands in the durable log and the read model (the live channel's
+// source) renders it as a markdown image — never the 📎 file fallback.
 func TestEnqueueToSessionRendersInboundImageAsMarkdown(t *testing.T) {
 	t.Setenv("KLAX_DATA_DIR", t.TempDir())
 	tp := &fakeTransport{}
@@ -123,17 +122,18 @@ func TestEnqueueToSessionRendersInboundImageAsMarkdown(t *testing.T) {
 	d.uiHub = newUIHub()
 
 	sess := d.store.SessionsFor("user:alice")[0]
-	created := sess.Created
-	d.runners[runnerKey{sk: "user:alice", created: created}] = &sessionRunner{runner: runner.New(), processing: true}
+	klaxID := sess.KlaxID
+	d.runners[runnerKey{sk: "user:alice", klaxID: klaxID}] = &sessionRunner{runner: runner.New(), processing: true}
 
 	png, err := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAD0lEQVR4nGP8z8DAwMAAAAYIAQHLR3Z1AAAAAElFTkSuQmCC")
 	if err != nil {
 		t.Fatal(err)
 	}
-	d.enqueueToSession("tg:1", "100", "", []attachment{{filename: "image.png", data: png}}, created, "")
+	d.enqueueToSession("tg:1", "100", "", []attachment{{filename: "image.png", data: png}}, klaxID, "")
 
 	found := false
-	for _, ut := range d.readModel("user:alice", sess) {
+	rows, _, _ := d.readModelBuild("user:alice", sess)
+	for _, ut := range rows {
 		if ut.Role != "user" {
 			continue
 		}
@@ -153,7 +153,7 @@ func TestEnqueueToSessionRendersInboundImageAsMarkdown(t *testing.T) {
 }
 
 // Aborting a session marks every still-queued turn err in the durable log; the read model (which
-// the tail delivers) then renders both as error turns — no live error event needed.
+// the live channel publishes) then renders both as error turns — no live error event needed.
 func TestAbortSessionMarksQueuedTurnsErrInReadModel(t *testing.T) {
 	t.Setenv("KLAX_DATA_DIR", t.TempDir())
 	tp := &fakeTransport{}
@@ -164,17 +164,18 @@ func TestAbortSessionMarksQueuedTurnsErrInReadModel(t *testing.T) {
 	d.uiHub = newUIHub()
 
 	sess := d.store.SessionsFor("user:alice")[0]
-	created := sess.Created
-	d.runners[runnerKey{sk: "user:alice", created: created}] = &sessionRunner{runner: runner.New(), processing: true}
-	d.enqueueToSession("tg:1", "100", "one", nil, created, "")
-	d.enqueueToSession("tg:1", "101", "two", nil, created, "")
+	klaxID := sess.KlaxID
+	d.runners[runnerKey{sk: "user:alice", klaxID: klaxID}] = &sessionRunner{runner: runner.New(), processing: true}
+	d.enqueueToSession("tg:1", "100", "one", nil, klaxID, "")
+	d.enqueueToSession("tg:1", "101", "two", nil, klaxID, "")
 
-	if !d.abortSession("user:alice", created, false) {
+	if !d.abortSession("user:alice", klaxID, false) {
 		t.Fatal("abortSession returned false for queued turns")
 	}
 
 	errs := 0
-	for _, ut := range d.readModel("user:alice", sess) {
+	rows, _, _ := d.readModelBuild("user:alice", sess)
+	for _, ut := range rows {
 		if ut.State == "err" {
 			errs++
 		}

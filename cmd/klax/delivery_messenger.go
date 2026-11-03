@@ -21,15 +21,15 @@ import (
 // snapshots arrive, and on Final renders the answer (or error) and flushes it
 // to the chain. Nothing about its behaviour changed in the extraction.
 type messengerDelivery struct {
-	d              *daemon
-	ctx            context.Context // run context; /abort cancels it to unblock edits
-	chatID         string
-	replyTo        string
-	chatFmt        string
-	verbose        bool
-	hasTransport   bool
-	sessionKey     string
-	sessionCreated int64
+	d             *daemon
+	ctx           context.Context // run context; /abort cancels it to unblock edits
+	chatID        string
+	replyTo       string
+	chatFmt       string
+	verbose       bool
+	hasTransport  bool
+	sessionKey    string
+	sessionKlaxID string
 
 	// chain is the progress/answer message chain. Only the worker mutates it
 	// until stopWorker() returns; Final reads it afterwards (no race).
@@ -52,18 +52,18 @@ func (d *daemon) newMessengerDelivery(ctx context.Context, msg queuedMsg, verbos
 	richMode := chatFmt == "rich"
 
 	m := &messengerDelivery{
-		d:              d,
-		ctx:            ctx,
-		chatID:         msg.chatID,
-		replyTo:        msg.msgID,
-		chatFmt:        chatFmt,
-		verbose:        verbose,
-		hasTransport:   t != nil,
-		sessionKey:     msg.sessKey,
-		sessionCreated: msg.sessCreated,
-		progressCh:     make(chan []runner.ProgressEvent, 1),
-		progressDone:   make(chan struct{}),
-		workerDone:     make(chan struct{}),
+		d:             d,
+		ctx:           ctx,
+		chatID:        msg.chatID,
+		replyTo:       msg.msgID,
+		chatFmt:       chatFmt,
+		verbose:       verbose,
+		hasTransport:  t != nil,
+		sessionKey:    msg.sessKey,
+		sessionKlaxID: msg.klaxID,
+		progressCh:    make(chan []runner.ProgressEvent, 1),
+		progressDone:  make(chan struct{}),
+		workerDone:    make(chan struct{}),
 	}
 
 	// Progress message — edit in place. If this message was queued and nothing
@@ -160,9 +160,6 @@ func (m *messengerDelivery) startWorker() {
 // Progress is the runner.ProgressFunc. It runs in the stdout-scanner goroutine
 // and only ever appends and does a non-blocking mailbox send — never network.
 func (m *messengerDelivery) Progress(ev runner.ProgressEvent) {
-	if ev.Kind == runner.ProgressKindContext {
-		return
-	}
 	if !m.verbose {
 		return
 	}
@@ -274,7 +271,7 @@ func (m *messengerDelivery) sendOutboundFiles(answer string) {
 	if !ok {
 		return
 	}
-	sess := m.d.store.Get(m.msgSessionKey(), m.msgSessionCreated())
+	sess := m.d.store.Get(m.msgSessionKey(), m.msgSessionKlaxID())
 	if sess == nil {
 		return
 	}
@@ -309,7 +306,7 @@ func (m *messengerDelivery) sendOutboundFiles(answer string) {
 // constructor; kept as methods so file delivery cannot accidentally use the
 // current active session after /switch or /new.
 func (m *messengerDelivery) msgSessionKey() string    { return m.sessionKey }
-func (m *messengerDelivery) msgSessionCreated() int64 { return m.sessionCreated }
+func (m *messengerDelivery) msgSessionKlaxID() string { return m.sessionKlaxID }
 
 func (m *messengerDelivery) Close() {
 	m.stopWorker()

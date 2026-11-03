@@ -49,6 +49,8 @@ func normalizeCommand(cmd string, args []string) (string, []string) {
 		return "/verbose", append([]string{cmd[len("/verbose_"):]}, args...)
 	case strings.HasPrefix(cmd, "/attachments_") && len(cmd) > len("/attachments_"):
 		return "/attachments", append([]string{cmd[len("/attachments_"):]}, args...)
+	case cmd == "/m_update" || cmd == "/t_update":
+		return "/m_update", args
 	case strings.HasPrefix(cmd, "/m_") && len(cmd) > len("/m_"):
 		return "/__set_model", []string{cmd[len("/m_"):]}
 	case strings.HasPrefix(cmd, "/t_") && len(cmd) > len("/t_"):
@@ -93,11 +95,11 @@ func effectiveBackendName(cfg *config.Config, def *session.ScopeDefaults, sess *
 
 func sessionCreatedText(cfg *config.Config, chatID string, def *session.ScopeDefaults, sess *session.Session) string {
 	backend := effectiveBackendName(cfg, def, sess)
-	model := sess.ModelOverride
+	model := sess.ModelRequested
 	if model == "" {
 		model = "по умолчанию"
 	}
-	think := sess.ThinkOverride
+	think := sess.Think
 	if think == "" {
 		think = "по умолчанию"
 	}
@@ -117,11 +119,11 @@ func sessionCreatedText(cfg *config.Config, chatID string, def *session.ScopeDef
 
 func sessionSwitchedText(cfg *config.Config, chatID string, def *session.ScopeDefaults, sess *session.Session, sessionsText string) string {
 	backend := effectiveBackendName(cfg, def, sess)
-	model := sess.ModelOverride
+	model := sess.ModelRequested
 	if model == "" {
 		model = "по умолчанию"
 	}
-	think := sess.ThinkOverride
+	think := sess.Think
 	if think == "" {
 		think = "по умолчанию"
 	}
@@ -154,7 +156,7 @@ func (d *daemon) handleBackendSet(chatID, msgID, sk, name string) {
 		d.sendMessage(chatID, msgID, "Backend нельзя изменить после первого сообщения.")
 		return
 	}
-	if d.isSessionBusy(sk, sess.Created) {
+	if d.isSessionBusy(sk, sess.KlaxID) {
 		d.sendMessage(chatID, msgID, sessionBusyText)
 		return
 	}
@@ -166,15 +168,15 @@ func (d *daemon) handleBackendSet(chatID, msgID, sk, name string) {
 	d.store.UpdateScopeDefaults(sk, func(def *session.ScopeDefaults) {
 		def.Backend = name
 		if current != name {
-			def.Model = ""
+			def.ModelRequested = ""
 			def.Think = ""
 		}
 	})
-	sess = d.store.UpdateSession(sk, sess.Created, func(sess *session.Session) {
+	sess = d.store.UpdateSession(sk, sess.KlaxID, func(sess *session.Session) {
 		sess.Backend = name
 		if current != name {
-			sess.ModelOverride = ""
-			sess.ThinkOverride = ""
+			sess.ModelRequested = ""
+			sess.Think = ""
 		}
 	})
 	if sess == nil {
@@ -184,44 +186,67 @@ func (d *daemon) handleBackendSet(chatID, msgID, sk, name string) {
 	d.sendMessage(chatID, msgID, d.settingsText(chatID, sk, sess))
 }
 
-func (d *daemon) handleModelSet(chatID, msgID, sk, alias string) {
+func (d *daemon) handleModelsUpdate(chatID, msgID, sk string) {
 	sess := d.store.Active(sk)
 	if sess == nil {
 		d.sendMessage(chatID, msgID, "Нет активной сессии")
 		return
 	}
-	if d.isSessionBusy(sk, sess.Created) {
+	if d.models == nil {
+		d.sendMessage(chatID, msgID, "Каталог моделей недоступен")
+		return
+	}
+	backend := effectiveBackendName(d.cfg, d.scopeDefaults(sk), sess)
+	d.mu.Lock()
+	if d.draining {
+		d.mu.Unlock()
+		d.sendMessage(chatID, msgID, "Перезапуск: обнови список после запуска.")
+		return
+	}
+	d.drainWg.Add(1)
+	d.mu.Unlock()
+	go func() {
+		defer d.drainWg.Done()
+		if _, err := d.models.Refresh(context.Background(), backend); err != nil {
+			d.sendMessage(chatID, msgID, "Не удалось обновить список моделей: "+html.EscapeString(err.Error()))
+			return
+		}
+		text := "Модели " + backend + " обновлены."
+		current := d.store.Active(sk)
+		if current != nil && current.KlaxID == sess.KlaxID && effectiveBackendName(d.cfg, d.scopeDefaults(sk), current) == backend {
+			text += "\n\n🤖 Модель:\n" + d.modelText(sk, current) + "\n🧠 Мышление:\n" + d.thinkText(sk, current)
+		}
+		d.sendMessage(chatID, msgID, text)
+	}()
+}
+
+func (d *daemon) handleModelSet(chatID, msgID, sk, model string) {
+	sess := d.store.Active(sk)
+	if sess == nil {
+		d.sendMessage(chatID, msgID, "Нет активной сессии")
+		return
+	}
+	if d.isSessionBusy(sk, sess.KlaxID) {
 		d.sendMessage(chatID, msgID, sessionBusyText)
 		return
 	}
-	if alias == "default" {
-		d.store.UpdateScopeDefaults(sk, func(def *session.ScopeDefaults) {
-			def.Model = ""
-		})
-		sess = d.store.UpdateSession(sk, sess.Created, func(sess *session.Session) {
-			sess.ModelOverride = ""
-		})
-		if sess == nil {
-			return
-		}
-		d.saveStore()
-		d.sendMessage(chatID, msgID, d.settingsText(chatID, sk, sess))
-		return
+	if model == "default" {
+		model = ""
 	}
-	def := d.scopeDefaults(sk)
-	backend := effectiveBackendName(d.cfg, def, sess)
-	resolved := alias
-	for _, m := range modelsForBackend(backend) {
-		if m.alias == alias {
-			resolved = m.model
-			break
-		}
-	}
+
+	backend := effectiveBackendName(d.cfg, d.scopeDefaults(sk), sess)
+	resetThink := model != sess.ModelRequested && !validOption(d.effortsForModel(backend, model), sess.Think)
 	d.store.UpdateScopeDefaults(sk, func(def *session.ScopeDefaults) {
-		def.Model = resolved
+		def.ModelRequested = model
+		if resetThink {
+			def.Think = ""
+		}
 	})
-	sess = d.store.UpdateSession(sk, sess.Created, func(sess *session.Session) {
-		sess.ModelOverride = resolved
+	sess = d.store.UpdateSession(sk, sess.KlaxID, func(sess *session.Session) {
+		sess.ModelRequested = model
+		if resetThink {
+			sess.Think = ""
+		}
 	})
 	if sess == nil {
 		return
@@ -236,7 +261,7 @@ func (d *daemon) handleThinkSet(chatID, msgID, sk, alias string) {
 		d.sendMessage(chatID, msgID, "Нет активной сессии")
 		return
 	}
-	if d.isSessionBusy(sk, sess.Created) {
+	if d.isSessionBusy(sk, sess.KlaxID) {
 		d.sendMessage(chatID, msgID, sessionBusyText)
 		return
 	}
@@ -244,8 +269,8 @@ func (d *daemon) handleThinkSet(chatID, msgID, sk, alias string) {
 		d.store.UpdateScopeDefaults(sk, func(def *session.ScopeDefaults) {
 			def.Think = ""
 		})
-		sess = d.store.UpdateSession(sk, sess.Created, func(sess *session.Session) {
-			sess.ThinkOverride = ""
+		sess = d.store.UpdateSession(sk, sess.KlaxID, func(sess *session.Session) {
+			sess.Think = ""
 		})
 		if sess == nil {
 			return
@@ -256,18 +281,15 @@ func (d *daemon) handleThinkSet(chatID, msgID, sk, alias string) {
 	}
 	def := d.scopeDefaults(sk)
 	backend := effectiveBackendName(d.cfg, def, sess)
-	resolved := alias
-	for _, e := range effortsForBackend(backend) {
-		if e.alias == alias {
-			resolved = e.model
-			break
-		}
+	if !validOption(d.effortsForModel(backend, sess.ModelRequested), alias) {
+		d.sendMessage(chatID, msgID, "Уровень мышления недоступен для выбранной модели. Открой /think для актуального списка.")
+		return
 	}
 	d.store.UpdateScopeDefaults(sk, func(def *session.ScopeDefaults) {
-		def.Think = resolved
+		def.Think = alias
 	})
-	sess = d.store.UpdateSession(sk, sess.Created, func(sess *session.Session) {
-		sess.ThinkOverride = resolved
+	sess = d.store.UpdateSession(sk, sess.KlaxID, func(sess *session.Session) {
+		sess.Think = alias
 	})
 	if sess == nil {
 		return
@@ -286,14 +308,14 @@ func (d *daemon) handleSandboxSet(chatID, msgID, sk, mode string) {
 		d.sendMessage(chatID, msgID, d.sandboxText(sk, sess))
 		return
 	}
-	if d.isSessionBusy(sk, sess.Created) {
+	if d.isSessionBusy(sk, sess.KlaxID) {
 		d.sendMessage(chatID, msgID, sessionBusyText)
 		return
 	}
 	d.store.UpdateScopeDefaults(sk, func(def *session.ScopeDefaults) {
 		def.Sandbox = mode
 	})
-	sess = d.store.UpdateSession(sk, sess.Created, func(sess *session.Session) {
+	sess = d.store.UpdateSession(sk, sess.KlaxID, func(sess *session.Session) {
 		sess.Sandbox = mode
 	})
 	if sess == nil {
@@ -317,16 +339,16 @@ func (d *daemon) handleTTYSet(chatID, msgID, sk, mode string) {
 		d.sendMessage(chatID, msgID, "TTY (только claude)")
 		return
 	}
-	if d.isSessionBusy(sk, sess.Created) {
+	if d.isSessionBusy(sk, sess.KlaxID) {
 		d.sendMessage(chatID, msgID, sessionBusyText)
 		return
 	}
 	on := mode == "on"
 	d.store.UpdateScopeDefaults(sk, func(def *session.ScopeDefaults) {
-		def.ClaudeTTY = on
+		def.TTY = on
 	})
-	sess = d.store.UpdateSession(sk, sess.Created, func(sess *session.Session) {
-		sess.ClaudeTTY = on
+	sess = d.store.UpdateSession(sk, sess.KlaxID, func(sess *session.Session) {
+		sess.TTY = on
 	})
 	if sess == nil {
 		return
@@ -411,15 +433,15 @@ func (d *daemon) handleSessionDelete(chatID, msgID, sk, n string) {
 		d.sendMessage(chatID, msgID, "Нельзя удалить активную сессию.")
 		return
 	}
-	if d.isSessionBusy(sk, target.Created) {
+	if d.isSessionBusy(sk, target.KlaxID) {
 		d.sendMessage(chatID, msgID, "⏳ Сессия занята: дождись завершения или сначала переключись и /abort.")
 		return
 	}
-	d.abortSession(sk, target.Created, true)
-	d.store.DeleteCreated(sk, target.Created)
-	d.removeSessionStore(sk, target.Created) // before dropRunner: latch the runner-owned store
-	d.dropRunner(sk, target.Created)
-	d.saveStore()
+	if _, err := d.closeSession(sk, target.KlaxID); err != nil {
+		log.Printf("delete session: %v", err)
+		d.sendMessage(chatID, msgID, "❌ Не удалось сохранить удаление сессии.")
+		return
+	}
 	d.sendMessage(chatID, msgID, d.cleanupText(sk))
 }
 
@@ -461,31 +483,25 @@ func (d *daemon) defaultSessionCWD(chatID, sk string) string {
 	return cwd
 }
 
-// deleteInactiveSessions aborts and removes every non-active session in the
-// chat — /nuke wipes the slate, so a session with work in flight is aborted
-// (run cancelled, queued messages marked aborted) before being deleted, not
-// spared. The aborted run unwinds on its own goroutine; its final persist via
-// UpdateSession becomes a no-op once the record is gone (same as a session
-// deleted mid-run). Returns how many sessions were deleted and how many of
-// those had to be aborted. Iterates the SessionsFor snapshot high-to-low so
-// each Store.Delete only shifts indices already passed.
-func (d *daemon) deleteInactiveSessions(sk string) (deleted, aborted int) {
+// deleteInactiveSessions persists removal of each inactive session before aborting
+// its queued and running work and deleting its files.
+func (d *daemon) deleteInactiveSessions(sk string) (deleted, aborted int, err error) {
 	sessions := d.store.SessionsFor(sk)
 	for i := len(sessions) - 1; i >= 0; i-- {
 		s := sessions[i]
 		if s.Active {
 			continue
 		}
-		if d.abortSession(sk, s.Created, true) {
+		wasAborted, err := d.closeSession(sk, s.KlaxID)
+		if err != nil {
+			return deleted, aborted, err
+		}
+		if wasAborted {
 			aborted++
 		}
-		if d.store.DeleteCreated(sk, s.Created) {
-			d.removeSessionStore(sk, s.Created) // before dropRunner: latch the runner-owned store
-			d.dropRunner(sk, s.Created)
-			deleted++
-		}
+		deleted++
 	}
-	return deleted, aborted
+	return deleted, aborted, nil
 }
 
 // argPayload returns everything after the first whitespace-delimited word in text.
@@ -500,10 +516,16 @@ func argPayload(text string) string {
 
 func (d *daemon) handleCommand(chatID, msgID, text string) {
 	parts := strings.Fields(text)
-	cmd := strings.ToLower(parts[0])
+	cmd := parts[0]
 	// Strip @botname suffix (e.g. /sessions@klax_bot → /sessions)
 	if at := strings.Index(cmd, "@"); at != -1 {
 		cmd = cmd[:at]
+	}
+	lower := strings.ToLower(cmd)
+	if strings.HasPrefix(lower, "/m_") && lower != "/m_default" && lower != "/m_update" {
+		cmd = "/m_" + cmd[len("/m_"):]
+	} else {
+		cmd = lower
 	}
 	args := parts[1:]
 	cmd, args = normalizeCommand(cmd, args)
@@ -547,13 +569,23 @@ func (d *daemon) handleCommand(chatID, msgID, text string) {
 		d.sendMessage(chatID, msgID, sessionCreatedText(d.cfg, chatID, def, sess))
 
 	case "/nuke":
-		sess, def := d.createSession(chatID, sk, sessionNameArg(args))
-		deleted, aborted := d.deleteInactiveSessions(sk)
-		d.saveStore()
+		name := sessionNameArg(args)
+		def := d.scopeDefaults(sk)
+		sess, err := d.createUISessionAtomic(sk, chatID, uiSettingsPatch{Name: &name})
+		if err != nil {
+			log.Printf("save new session: %v", err)
+			d.sendMessage(chatID, msgID, "❌ Не удалось сохранить новую сессию.")
+			return
+		}
+		deleted, aborted, err := d.deleteInactiveSessions(sk)
 		msg := sessionCreatedText(d.cfg, chatID, def, sess)
 		msg += fmt.Sprintf("\n\n💥 Снесено сессий: %d", deleted)
 		if aborted > 0 {
 			msg += fmt.Sprintf("\n❌ Прервано занятых: %d", aborted)
+		}
+		if err != nil {
+			log.Printf("delete inactive sessions: %v", err)
+			msg += "\n❌ Не удалось сохранить удаление остальных сессий."
 		}
 		d.sendMessage(chatID, msgID, msg)
 
@@ -567,7 +599,7 @@ func (d *daemon) handleCommand(chatID, msgID, text string) {
 			d.sendMessage(chatID, msgID, "Нет активной сессии")
 			return
 		}
-		sess = d.store.UpdateSession(sk, sess.Created, func(sess *session.Session) {
+		sess = d.store.UpdateSession(sk, sess.KlaxID, func(sess *session.Session) {
 			sess.Name = strings.Join(args, " ")
 		})
 		if sess == nil {
@@ -594,7 +626,7 @@ func (d *daemon) handleCommand(chatID, msgID, text string) {
 			d.sendMessage(chatID, msgID, "Рабочую директорию нельзя изменить после первого сообщения.")
 			return
 		}
-		if d.isSessionBusy(sk, active.Created) {
+		if d.isSessionBusy(sk, active.KlaxID) {
 			d.sendMessage(chatID, msgID, sessionBusyText)
 			return
 		}
@@ -603,16 +635,9 @@ func (d *daemon) handleCommand(chatID, msgID, text string) {
 			d.sendMessage(chatID, msgID, fmt.Sprintf("❌ %s", html.EscapeString(err.Error())))
 			return
 		}
-		if resolveSessionBackend(active, d.scopeDefaults(sk), d.cfg.GetDefaultBackend()) == "claude" {
-			if err := migrateClaudeTranscript(active.CWD, cwd, active.ID); err != nil {
-				log.Printf("claude transcript migration failed for %s: %v", active.ID, err)
-				d.sendMessage(chatID, msgID, "Не удалось перенести историю Claude для нового CWD.")
-				return
-			}
-		}
 		// Re-check Messages==0 atomically with the write: a message could have started
 		// and finished running between the snapshot check above and this call.
-		sess, ok := d.store.SetCWDIfMessages0(sk, active.Created, cwd)
+		sess, ok := d.store.SetCWDIfMessages0(sk, active.KlaxID, cwd)
 		if !ok {
 			d.sendMessage(chatID, msgID, "Рабочую директорию нельзя изменить после первого сообщения.")
 			return
@@ -627,25 +652,25 @@ func (d *daemon) handleCommand(chatID, msgID, text string) {
 			return
 		}
 		if len(parts) < 2 {
-			if sess.AppendSystemPrompt == "" {
+			if sess.SystemPrompt == "" {
 				d.sendMessage(chatID, msgID, "Системный промпт не задан.")
 			} else {
-				d.sendMessage(chatID, msgID, fmt.Sprintf("📝 <code>%s</code>", html.EscapeString(sess.AppendSystemPrompt)))
+				d.sendMessage(chatID, msgID, fmt.Sprintf("📝 <code>%s</code>", html.EscapeString(sess.SystemPrompt)))
 			}
 			return
 		}
-		if d.isSessionBusy(sk, sess.Created) {
+		if d.isSessionBusy(sk, sess.KlaxID) {
 			d.sendMessage(chatID, msgID, sessionBusyText)
 			return
 		}
-		sess = d.store.UpdateSession(sk, sess.Created, func(sess *session.Session) {
-			sess.AppendSystemPrompt = argPayload(text)
+		sess = d.store.UpdateSession(sk, sess.KlaxID, func(sess *session.Session) {
+			sess.SystemPrompt = argPayload(text)
 		})
 		if sess == nil {
 			return
 		}
 		d.saveStore()
-		d.sendMessage(chatID, msgID, fmt.Sprintf("📝 <code>%s</code>", html.EscapeString(sess.AppendSystemPrompt)))
+		d.sendMessage(chatID, msgID, fmt.Sprintf("📝 <code>%s</code>", html.EscapeString(sess.SystemPrompt)))
 
 	case "/model", "/models", "/m":
 		sess := d.store.Active(sk)
@@ -742,14 +767,31 @@ func (d *daemon) handleCommand(chatID, msgID, text string) {
 			d.sendMessage(chatID, msgID, "Нет активной сессии")
 			return
 		}
-		if !d.abortSession(sk, active.Created, false) {
+		if !d.abortSession(sk, active.KlaxID, false) {
 			d.sendMessage(chatID, msgID, noActiveSessionMessagesText)
 			return
 		}
 		d.sendMessage(chatID, msgID, abortReplyText)
 
+	case "/m_update":
+		d.handleModelsUpdate(chatID, msgID, sk)
+
 	case "/__set_model":
-		d.handleModelSet(chatID, msgID, sk, args[0])
+		if len(args) != 1 {
+			return
+		}
+		model := args[0]
+		if model != "default" {
+			sess := d.store.Active(sk)
+			backend := effectiveBackendName(d.cfg, d.scopeDefaults(sk), sess)
+			resolved, ok := resolveModelCommand(d.modelsForBackend(backend), model)
+			if !ok {
+				d.sendMessage(chatID, msgID, "Модель не найдена или команда неоднозначна. Открой /model для актуального списка.")
+				return
+			}
+			model = resolved
+		}
+		d.handleModelSet(chatID, msgID, sk, model)
 
 	case "/__set_think":
 		d.handleThinkSet(chatID, msgID, sk, args[0])

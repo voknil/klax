@@ -82,7 +82,7 @@ func (b *ClaudeBackend) BuildCmd(opts RunOptions) (*exec.Cmd, error) {
 	b.inTextBlock = false
 	args := BuildClaudeArgs(opts)
 
-	bin := findBinary("claude", []string{".local/bin/claude"})
+	bin := FindBinary("claude")
 	if bin == "" {
 		return nil, errors.New("claude not found. Install: curl -fsSL https://claude.ai/install.sh | bash")
 	}
@@ -274,25 +274,12 @@ func (b *ClaudeBackend) ParseEvent(line []byte) ([]Event, bool) {
 		if ev.Message == nil {
 			return nil, false
 		}
-		// Track context usage from message; stamp it on the first emitted
-		// event so the runner can track it without double-counting.
-		var usage ModelUsageInfo
-		if u := ev.Message.Usage; u != nil {
-			usage.ContextUsed = u.InputTokens + u.CacheRead + u.CacheCreation
-		}
 		var out []Event
 		for _, block := range ev.Message.Content {
 			switch block.Type {
 			case "tool_use":
 				name, input := NormalizeClaudeToolUse(block.Name, block.Input)
-				e := Event{
-					Type: EventTool,
-					Tool: ToolUse{Name: name, Input: input},
-				}
-				if len(out) == 0 {
-					e.Usage = usage
-				}
-				out = append(out, e)
+				out = append(out, Event{Type: EventTool, Tool: ToolUse{Name: name, Input: input}})
 			case "text":
 				// Under --include-partial-messages this block mirrors the
 				// text we already streamed via deltas; skip it. Without
@@ -301,11 +288,7 @@ func (b *ClaudeBackend) ParseEvent(line []byte) ([]Event, bool) {
 				if b.partialDeltaSeen {
 					continue
 				}
-				e := Event{Type: EventText, Text: block.Text}
-				if len(out) == 0 {
-					e.Usage = usage
-				}
-				out = append(out, e)
+				out = append(out, Event{Type: EventText, Text: block.Text})
 			}
 			// Other block types (`thinking`, `redacted_thinking`, `image`) are
 			// intentionally dropped — extended-thinking blocks would flood the
@@ -407,8 +390,15 @@ func claudePlanInput(raw json.RawMessage) string {
 	return MarshalPlanProgress(done, len(parsed.Todos), current)
 }
 
-// findBinary looks for a binary by name, with fallback paths relative to $HOME.
-func findBinary(name string, homePaths []string) string {
+// FindBinary locates a backend CLI in PATH or its standard install directories.
+func FindBinary(name string) string {
+	var homePaths []string
+	switch name {
+	case "claude":
+		homePaths = []string{".local/bin/claude"}
+	case "codex":
+		homePaths = []string{".npm-global/bin/codex"}
+	}
 	if p, err := exec.LookPath(name); err == nil {
 		return p
 	}

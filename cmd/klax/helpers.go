@@ -238,56 +238,42 @@ type modelEntry struct {
 	label string
 }
 
-// Claude models are launched by their bare CLI alias — the alias resolves to the
-// current model on its own (fable→claude-fable-5, opus→claude-opus-4-8, …), so
-// klax carries no window markers or per-model logic.
-var claudeModels = []modelEntry{
-	{"fable", "fable", "Fable"},
-	{"opus", "opus", "Opus"},
-	{"sonnet", "sonnet", "Sonnet"},
-	{"haiku", "haiku", "Haiku"},
-}
+var modelCommandUnsafe = regexp.MustCompile(`[^A-Za-z0-9]`)
 
-// Codex: the three GPT-5.6 variants (most-capable first) plus GPT-5.5 as an
-// explicit fallback. "По умолчанию" (empty) covers "let Codex decide". Bare
-// gpt-5.6 is intentionally absent — the local ChatGPT-account Codex rejects it.
-var codexModels = []modelEntry{
-	{"sol", "gpt-5.6-sol", "GPT-5.6 Sol"},
-	{"terra", "gpt-5.6-terra", "GPT-5.6 Terra"},
-	{"luna", "gpt-5.6-luna", "GPT-5.6 Luna"},
-	{"55", "gpt-5.5", "GPT-5.5"},
-}
-
-func modelsForBackend(backend string) []modelEntry {
-	if backend == "codex" {
-		return codexModels
+func (d *daemon) modelsForBackend(backend string) []modelEntry {
+	models := d.models.Models(backend)
+	entries := make([]modelEntry, 0, len(models))
+	for _, m := range models {
+		encoded := modelCommandUnsafe.ReplaceAllString(m.Value, "_")
+		entries = append(entries, modelEntry{encoded, m.Value, m.Value})
 	}
-	return claudeModels
+	return entries
 }
 
-// Effort levels start at High: low/medium go unused in practice, and the
-// separate "По умолчанию" (empty) choice already covers "let the CLI decide".
-// The CLI enum still accepts the lower levels — klax simply doesn't offer them.
-var claudeEfforts = []modelEntry{
-	{"high", "high", "High"},
-	{"xhigh", "xhigh", "Extra High"},
-	{"max", "max", "Max"},
-}
-
-// Codex GPT-5.6 exposes the deeper Max/Ultra reasoning levels on top of High/
-// Extra High; low/medium stay omitted, "По умолчанию" covers the CLI default.
-var codexEfforts = []modelEntry{
-	{"high", "high", "High"},
-	{"xhigh", "xhigh", "Extra High"},
-	{"max", "max", "Max"},
-	{"ultra", "ultra", "Ultra"},
-}
-
-func effortsForBackend(backend string) []modelEntry {
-	if backend == "codex" {
-		return codexEfforts
+func resolveModelCommand(entries []modelEntry, token string) (string, bool) {
+	model := ""
+	for _, entry := range entries {
+		if entry.alias == token {
+			if model != "" {
+				return "", false
+			}
+			model = entry.model
+		}
 	}
-	return claudeEfforts
+	return model, model != ""
+}
+
+func (d *daemon) effortsForModel(backend, model string) []modelEntry {
+	for _, m := range d.models.Models(backend) {
+		if (model != "" && m.Value == model) || (model == "" && m.Default) {
+			entries := make([]modelEntry, 0, len(m.ThinkLevels))
+			for _, effort := range m.ThinkLevels {
+				entries = append(entries, modelEntry{effort, effort, effort})
+			}
+			return entries
+		}
+	}
+	return nil
 }
 
 func (d *daemon) backendText(sk string, sess *session.Session) string {
@@ -307,21 +293,25 @@ func (d *daemon) backendText(sk string, sess *session.Session) string {
 func (d *daemon) modelText(sk string, sess *session.Session) string {
 	def := d.scopeDefaults(sk)
 	backend := resolveSessionBackend(sess, def, d.cfg.GetDefaultBackend())
-	models := modelsForBackend(backend)
+	models := d.modelsForBackend(backend)
 
 	var sb strings.Builder
-	current := sess.ModelOverride
-	for _, m := range models {
-		if m.model == current {
-			fmt.Fprintf(&sb, "<b>/m_%s %s ✅</b>\n", m.alias, m.label)
-		} else {
-			fmt.Fprintf(&sb, "/m_%s %s\n", m.alias, m.label)
-		}
-	}
+	current := sess.ModelRequested
 	if current == "" {
 		fmt.Fprintf(&sb, "<b>/m_default По умолчанию ✅</b>\n")
 	} else {
 		fmt.Fprintf(&sb, "/m_default По умолчанию\n")
+	}
+	sb.WriteString("/m_update Обновить список\n")
+	for _, m := range models {
+		if m.model == current {
+			fmt.Fprintf(&sb, "<b>/m_%s %s ✅</b>\n", m.alias, html.EscapeString(m.label))
+		} else {
+			fmt.Fprintf(&sb, "/m_%s %s\n", m.alias, html.EscapeString(m.label))
+		}
+	}
+	if current != "" && !validOption(models, current) {
+		fmt.Fprintf(&sb, "<b>%s ✅</b>\n", html.EscapeString(current))
 	}
 	return sb.String()
 }
@@ -329,10 +319,16 @@ func (d *daemon) modelText(sk string, sess *session.Session) string {
 func (d *daemon) thinkText(sk string, sess *session.Session) string {
 	def := d.scopeDefaults(sk)
 	backend := resolveSessionBackend(sess, def, d.cfg.GetDefaultBackend())
-	efforts := effortsForBackend(backend)
+	efforts := d.effortsForModel(backend, sess.ModelRequested)
 
 	var sb strings.Builder
-	current := sess.ThinkOverride
+	current := sess.Think
+	if current == "" {
+		fmt.Fprintf(&sb, "<b>/t_default По умолчанию ✅</b>\n")
+	} else {
+		fmt.Fprintf(&sb, "/t_default По умолчанию\n")
+	}
+	sb.WriteString("/t_update Обновить список\n")
 	for _, e := range efforts {
 		if e.model == current {
 			fmt.Fprintf(&sb, "<b>/t_%s %s ✅</b>\n", e.alias, e.label)
@@ -340,10 +336,8 @@ func (d *daemon) thinkText(sk string, sess *session.Session) string {
 			fmt.Fprintf(&sb, "/t_%s %s\n", e.alias, e.label)
 		}
 	}
-	if current == "" {
-		fmt.Fprintf(&sb, "<b>/t_default По умолчанию ✅</b>\n")
-	} else {
-		fmt.Fprintf(&sb, "/t_default По умолчанию\n")
+	if current != "" && !validOption(efforts, current) {
+		fmt.Fprintf(&sb, "<b>%s ✅</b>\n", html.EscapeString(current))
 	}
 	return sb.String()
 }
@@ -359,7 +353,7 @@ func effectiveSandboxMode(def *session.ScopeDefaults, sess *session.Session) str
 }
 
 func claudeTTYLabel(sess *session.Session) string {
-	if sess != nil && sess.ClaudeTTY {
+	if sess != nil && sess.TTY {
 		return "on"
 	}
 	return "off"
@@ -383,7 +377,7 @@ func (d *daemon) ttyText(sk string, sess *session.Session) string {
 		return "TTY (только claude)"
 	}
 	var sb strings.Builder
-	if sess != nil && sess.ClaudeTTY {
+	if sess != nil && sess.TTY {
 		sb.WriteString("<b>/tty_on ✅</b>\n")
 		sb.WriteString("/tty_off\n")
 	} else {
@@ -541,7 +535,7 @@ func (d *daemon) statusText(chatID string) string {
 		return "❌ Нет активной сессии"
 	}
 
-	sr := d.lookupRunner(chatID, sess.Created)
+	sr := d.lookupRunner(chatID, sess.KlaxID)
 	var statusLine string
 	if sr == nil {
 		statusLine = "💤 Свободен"
@@ -569,14 +563,14 @@ func (d *daemon) statusText(chatID string) string {
 	}
 
 	backend := resolveSessionBackend(sess, d.scopeDefaults(chatID), d.cfg.GetDefaultBackend())
-	model := sess.Model
+	model := sess.ModelUsed
 	if model == "" {
-		model = sess.ModelOverride
+		model = sess.ModelRequested
 	}
 	if model == "" {
 		model = "по умолчанию"
 	}
-	think := sess.ThinkOverride
+	think := sess.Think
 	if think == "" {
 		think = "по умолчанию"
 	}
@@ -627,10 +621,10 @@ func timeAgo(t time.Time) string {
 }
 
 // hasMultipleBackends checks if sessions use more than one backend.
-func hasMultipleBackends(sessions []*session.Session) bool {
+func (d *daemon) hasMultipleBackends(sk string, sessions []*session.Session) bool {
 	seen := ""
 	for _, s := range sessions {
-		b := resolveSessionBackend(s, nil, "claude")
+		b := effectiveBackendName(d.cfg, d.scopeDefaults(sk), s)
 		if seen == "" {
 			seen = b
 		} else if seen != b {
@@ -643,7 +637,7 @@ func hasMultipleBackends(sessions []*session.Session) bool {
 // formatSessionLine renders one session line.
 // activePrefix/inactiveCmd control per-mode differences.
 // showBackend adds backend name after message count when multiple backends are used.
-func formatSessionLine(sb *strings.Builder, i int, s *session.Session, activePrefix, inactiveCmd string, showBackend bool) {
+func (d *daemon) formatSessionLine(sk string, sb *strings.Builder, i int, s *session.Session, activePrefix, inactiveCmd string, showBackend bool) {
 	ctx := ""
 	if s.ContextWindow > 0 {
 		pct := s.ContextUsed * 100 / s.ContextWindow
@@ -651,7 +645,7 @@ func formatSessionLine(sb *strings.Builder, i int, s *session.Session, activePre
 	}
 	backendSuffix := ""
 	if showBackend {
-		b := resolveSessionBackend(s, nil, "claude")
+		b := effectiveBackendName(d.cfg, d.scopeDefaults(sk), s)
 		backendSuffix = fmt.Sprintf(" (%s)", b)
 	}
 	if s.Active {
@@ -687,14 +681,14 @@ func (d *daemon) cleanupText(chatID string) string {
 	if len(sessions) == 0 {
 		return "Нет сессий."
 	}
-	multi := hasMultipleBackends(sessions)
+	multi := d.hasMultipleBackends(chatID, sessions)
 	var sb strings.Builder
 	inactive := 0
 	for i, s := range sessions {
 		if !s.Active {
 			inactive++
 		}
-		formatSessionLine(&sb, i, s, "✅ ", "❌ /d", multi)
+		d.formatSessionLine(chatID, &sb, i, s, "✅ ", "❌ /d", multi)
 	}
 	if inactive == 0 {
 		sb.WriteString("\nНечего удалять.")
@@ -709,10 +703,10 @@ func (d *daemon) sessionsText(chatID string) string {
 	if len(sessions) == 0 {
 		return "Нет сессий. Напиши /new"
 	}
-	multi := hasMultipleBackends(sessions)
+	multi := d.hasMultipleBackends(chatID, sessions)
 	var sb strings.Builder
 	for i, s := range sessions {
-		formatSessionLine(&sb, i, s, "", "/s", multi)
+		d.formatSessionLine(chatID, &sb, i, s, "", "/s", multi)
 	}
 	sb.WriteString("\n/cleanup — управление сессиями")
 	return sb.String()

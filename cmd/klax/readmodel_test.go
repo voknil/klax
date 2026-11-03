@@ -1,6 +1,10 @@
 package main
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -10,16 +14,16 @@ import (
 	"github.com/PiDmitrius/klax/internal/sessfiles"
 )
 
-func newReadModelDaemon(t *testing.T) (*daemon, int64) {
+func newReadModelDaemon(t *testing.T) (*daemon, string) {
 	t.Helper()
 	t.Setenv("KLAX_DATA_DIR", t.TempDir())
 	d := newTestDeliveryDaemon(&fakeTransport{})
 	d.store = newStoreWithChat("user:alice", "one")
 	d.runners = make(map[runnerKey]*sessionRunner)
 	d.uiHub = newUIHub() // UI on
-	created := d.store.SessionsFor("user:alice")[0].Created
-	d.getRunner("user:alice", created) // bind the runner-owned durable store
-	return d, created
+	klaxID := d.store.SessionsFor("user:alice")[0].KlaxID
+	d.getRunner("user:alice", klaxID) // bind the runner-owned durable store
+	return d, klaxID
 }
 
 func bindReadModelTurn(t *testing.T, st *sessfiles.Store, seq, event int64, text string) history.Item {
@@ -36,48 +40,45 @@ func bindReadModelTurn(t *testing.T, st *sessfiles.Store, seq, event int64, text
 	return history.Item{Role: "user", Text: text, Event: event, RecordDigest: recordDigest, PromptDigest: digest, Backend: backend, Session: session}
 }
 
-func testRM(d *daemon, created int64, items []history.Item, busy, latest bool) []uiTurn {
-	q, _ := d.sessionStore("user:alice", created).InboundLog()
-	return d.buildReadModel("user:alice", created, groupTurns(items), q, nil, busy, 0, latest, 1_000_000)
+func testRM(d *daemon, klaxID string, items []history.Item, busy bool) []uiTurn {
+	q, _ := d.sessionStore("user:alice", klaxID).InboundLog()
+	return d.buildReadModel("user:alice", klaxID, groupTurns(items), q, busy, nil)
 }
 
 // A turn still queued (enq, never run) is surfaced on the latest page as state "enq" with
 // its durable seq + text, and is NOT appended on an older (paginated) page.
 func TestReadModelQueuedSurfaced(t *testing.T) {
-	d, created := newReadModelDaemon(t)
-	sr := d.getRunner("user:alice", created)
+	d, klaxID := newReadModelDaemon(t)
+	sr := d.getRunner("user:alice", klaxID)
 	if _, _, _, _, err := sr.store.Enqueue("ui:alice", "", "n", "hello", nil); err != nil {
 		t.Fatal(err)
 	}
-	turns := testRM(d, created, nil, false, true)
+	turns := testRM(d, klaxID, nil, false)
 	if len(turns) != 1 || turns[0].State != "enq" || turns[0].Seq < 1 {
 		t.Fatalf("queued turn not surfaced as enq: %+v", turns)
 	}
 	if !strings.HasPrefix(turns[0].Text, "hello") {
 		t.Fatalf("durable text not used: %q", turns[0].Text)
 	}
-	if older := testRM(d, created, nil, false, false); len(older) != 0 {
-		t.Fatalf("older page must not append pending: %+v", older)
-	}
 }
 
 func TestReadModelKeepsDurableUserTimeWhenTranscriptAppears(t *testing.T) {
-	d, created := newReadModelDaemon(t)
-	sr := d.getRunner("user:alice", created)
+	d, klaxID := newReadModelDaemon(t)
+	sr := d.getRunner("user:alice", klaxID)
 	seq, _, _, _, err := sr.store.Enqueue("ui:alice", "", "n", "screenshot", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	queued := testRM(d, created, nil, false, true)
+	queued := testRM(d, klaxID, nil, false)
 	if len(queued) != 1 || queued[0].Time == "" {
 		t.Fatalf("queue-only turn missing durable time: %+v", queued)
 	}
 	user := bindReadModelTurn(t, sr.store, seq, 4, "screenshot")
 	user.Time = "2099-01-01T00:00:00Z"
-	fromTranscript := testRM(d, created, []history.Item{
+	fromTranscript := testRM(d, klaxID, []history.Item{
 		user,
 		{Role: "assistant", Text: "answer"},
-	}, false, true)
+	}, false)
 	if len(fromTranscript) != 1 {
 		t.Fatalf("transcript-backed turn shape: %+v", fromTranscript)
 	}
@@ -91,8 +92,8 @@ func TestReadModelKeepsDurableUserTimeWhenTranscriptAppears(t *testing.T) {
 // most-recent (in-progress) block is HELD back — represented by the working dots — so it never
 // shows as a settled bubble under the dots; the final block is revealed only at done.
 func TestReadModelRunningVsStale(t *testing.T) {
-	d, created := newReadModelDaemon(t)
-	sr := d.getRunner("user:alice", created)
+	d, klaxID := newReadModelDaemon(t)
+	sr := d.getRunner("user:alice", klaxID)
 	seq, _, _, _, err := sr.store.Enqueue("ui:alice", "", "n", "go", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -104,18 +105,17 @@ func TestReadModelRunningVsStale(t *testing.T) {
 		{Role: "assistant", Text: "here is the answer"},
 	}
 
-	busy := testRM(d, created, items, true, true)
+	busy := testRM(d, klaxID, items, true)
 	if len(busy) != 1 || busy[0].State != "run" {
 		t.Fatalf("busy newest run should be run: %+v", busy)
 	}
-	// Running: the last (in-progress) block is held, so only the earlier settled block shows and it
-	// has a stable id. The dots stand in for the block still being generated.
-	if len(busy[0].Blocks) != 1 || busy[0].Blocks[0].ID == "" || busy[0].Blocks[0].Role != "assistant" {
+	// Running: the last (in-progress) block is held, so only the earlier settled block shows. The dots stand in for the block still being generated.
+	if len(busy[0].Blocks) != 1 || busy[0].Blocks[0].Role != "assistant" {
 		t.Fatalf("running turn should show only settled blocks (last held): %+v", busy[0].Blocks)
 	}
 	// Idle (a missed MarkDone → resolved done): the turn is settled, so ALL blocks show — nothing
 	// is held, and the final message appears exactly here, when the engine knows the turn is over.
-	idle := testRM(d, created, items, false, true)
+	idle := testRM(d, klaxID, items, false)
 	if idle[0].State != "done" {
 		t.Fatalf("idle run (missed MarkDone) must resolve to done, got %q", idle[0].State)
 	}
@@ -125,8 +125,8 @@ func TestReadModelRunningVsStale(t *testing.T) {
 }
 
 func TestReadModelRunningKeepsToolProgressVisible(t *testing.T) {
-	d, created := newReadModelDaemon(t)
-	sr := d.getRunner("user:alice", created)
+	d, klaxID := newReadModelDaemon(t)
+	sr := d.getRunner("user:alice", klaxID)
 	seq, _, _, _, err := sr.store.Enqueue("ui:alice", "", "n", "go", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +138,7 @@ func TestReadModelRunningKeepsToolProgressVisible(t *testing.T) {
 		{Role: "tool", Text: "🗜 Compaction: context compacted"},
 	}
 
-	turns := testRM(d, created, items, true, true)
+	turns := testRM(d, klaxID, items, true)
 	if len(turns) != 1 || turns[0].State != "run" {
 		t.Fatalf("busy newest run should be run: %+v", turns)
 	}
@@ -153,17 +153,17 @@ func TestReadModelRunningKeepsToolProgressVisible(t *testing.T) {
 // A markerless transcript turn (legacy, pre-durable-queue) renders done with a stable
 // negative synthetic id that can never collide with a real durable seq (>= 1).
 func TestReadModelLegacyMarkerless(t *testing.T) {
-	d, created := newReadModelDaemon(t)
+	d, klaxID := newReadModelDaemon(t)
 	items := []history.Item{{Role: "user", Text: "old"}, {Role: "assistant", Text: "reply"}}
-	turns := testRM(d, created, items, false, true)
+	turns := testRM(d, klaxID, items, false)
 	if len(turns) != 1 || turns[0].Seq >= 0 || turns[0].State != "done" {
 		t.Fatalf("legacy markerless turn: %+v", turns)
 	}
 }
 
 func TestReadModelUnboundRecordPresentIsOneUnknownRow(t *testing.T) {
-	d, created := newReadModelDaemon(t)
-	sr := d.getRunner("user:alice", created)
+	d, klaxID := newReadModelDaemon(t)
+	sr := d.getRunner("user:alice", klaxID)
 	seq, _, _, _, err := sr.store.Enqueue("ui:alice", "", "n", "go", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -172,75 +172,58 @@ func TestReadModelUnboundRecordPresentIsOneUnknownRow(t *testing.T) {
 	if err := sr.store.MarkRunMeta(seq, "claude", "S", digest, 2); err != nil {
 		t.Fatal(err)
 	}
-	if err := sr.store.MarkDone(seq); err != nil {
+	if err := sr.store.MarkDone(seq, 0); err != nil {
 		t.Fatal(err)
 	}
 	items := []history.Item{
 		{Role: "user", Text: "go", Event: 3, RecordDigest: "record", PromptDigest: digest, Backend: "claude", Session: "S"},
 		{Role: "assistant", Text: "answer"},
 	}
-	turns := testRM(d, created, items, false, true)
+	turns := testRM(d, klaxID, items, false)
 	if len(turns) != 1 || turns[0].Seq != seq || turns[0].State != "unknown" {
 		t.Fatalf("unbound record rendered ambiguously: %+v", turns)
 	}
 }
 
-func TestReadModelUnboundRecordRemainsOnHistoricalPage(t *testing.T) {
-	d, created := newReadModelDaemon(t)
-	digest := promptcanon.Digest("go")
-	q := []sessfiles.Turn{{Seq: 1, Text: "go", TS: time.Now().UnixNano(), Last: "done", Backend: "claude", Session: "S", PromptDigest: digest, FromEvent: 2}}
-	items := []history.Item{
-		{Role: "user", Text: "go", Event: 3, RecordDigest: "record", PromptDigest: digest, Backend: "claude", Session: "S"},
-		{Role: "assistant", Text: "answer"},
-	}
-	turns := d.buildReadModel("user:alice", created, groupTurns(items), q, nil, false, 10, false, 1_000_000)
-	if len(turns) != 1 || turns[0].Seq >= 0 || len(turns[0].Blocks) != 1 || turns[0].Blocks[0].Text != "answer" {
-		t.Fatalf("historical transcript turn disappeared: %+v", turns)
-	}
-}
-
-func TestReadModelLatestDoesNotRepeatTurnsFromOlderPages(t *testing.T) {
-	d, created := newReadModelDaemon(t)
-	q := []sessfiles.Turn{
-		{Seq: 1, Text: "old", Marker: "1111111111111111", TS: time.Now().UnixNano(), Last: "done"},
-		{Seq: 2, Text: "new", Marker: "2222222222222222", TS: time.Now().UnixNano(), Last: "done"},
-	}
-	old := history.Item{Role: "user", Text: "old", Marker: q[0].Marker, Event: 3}
-	newer := history.Item{Role: "user", Text: "new", Marker: q[1].Marker, Event: 8}
-	all := []history.Item{old, {Role: "assistant", Text: "old answer"}, newer, {Role: "assistant", Text: "new answer"}}
-	presence := transcriptPresence(all, q)
-	page := groupTurns(all[2:])
-	turns := d.buildReadModel("user:alice", created, page, q, presence, false, 1, true, 1_000_000)
-	if len(turns) != 1 || turns[0].Seq != 2 {
-		t.Fatalf("latest page repeated historical turn: %+v", turns)
-	}
-}
-
 func TestReadModelLegacyMarkerWithoutTranscriptIsUnknown(t *testing.T) {
-	d, created := newReadModelDaemon(t)
+	d, klaxID := newReadModelDaemon(t)
 	for _, last := range []string{"run", "done"} {
 		q := []sessfiles.Turn{{Seq: 1, Text: "legacy", Marker: "0123456789abcdef", TS: time.Now().UnixNano(), Last: last}}
-		turns := d.buildReadModel("user:alice", created, nil, q, nil, false, 0, true, 1_000_000)
+		turns := d.buildReadModel("user:alice", klaxID, nil, q, false, nil)
 		if len(turns) != 1 || turns[0].State != "unknown" {
 			t.Fatalf("legacy %s without match: %+v", last, turns)
 		}
 	}
 }
 
+// The per-turn "cut line" context comes from the last assistant block's usage; when the
+// transcript carries no window (Claude) it is the window the turn's done record kept. A turn
+// without either never borrows the session's current window.
 func TestReadModelCarriesContextOnTurn(t *testing.T) {
-	d, created := newReadModelDaemon(t)
-	items := []history.Item{
-		{Role: "user", Text: "u"},
-		{Role: "assistant", Text: "a", CtxUsed: 144_000},
+	d, klaxID := newReadModelDaemon(t)
+	sr := d.getRunner("user:alice", klaxID)
+	seq, _, _, _, err := sr.store.Enqueue("ui:alice", "", "n", "u", nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	turns := testRM(d, created, items, false, true)
-	if len(turns) != 1 || len(turns[0].Blocks) != 1 {
+	items := []history.Item{
+		bindReadModelTurn(t, sr.store, seq, 1, "u"),
+		{Role: "assistant", Text: "a", CtxUsed: 144_000, Event: 2},
+		{Role: "user", Text: "native", Event: 3},
+		{Role: "assistant", Text: "b", CtxUsed: 150_000, Event: 4},
+	}
+	if err := sr.store.MarkDone(seq, 200_000); err != nil {
+		t.Fatal(err)
+	}
+	turns := testRM(d, klaxID, items, false)
+	if len(turns) != 2 {
 		t.Fatalf("context test model shape: %+v", turns)
 	}
-	// The per-turn "cut line" context comes from the last assistant block's usage; its window
-	// falls back to the session window when the transcript carries none (Claude).
-	if turns[0].CtxUsed != 144_000 || turns[0].CtxWindow != 1_000_000 {
-		t.Fatalf("turn context = %d/%d, want 144000/1000000", turns[0].CtxUsed, turns[0].CtxWindow)
+	if turns[0].CtxUsed != 144_000 || turns[0].CtxWindow != 200_000 {
+		t.Fatalf("turn context = %d/%d, want 144000/200000", turns[0].CtxUsed, turns[0].CtxWindow)
+	}
+	if turns[1].CtxUsed != 150_000 || turns[1].CtxWindow != 0 {
+		t.Fatalf("unrecorded turn context = %d/%d, want 150000/0", turns[1].CtxUsed, turns[1].CtxWindow)
 	}
 }
 
@@ -248,12 +231,12 @@ func TestReadModelCarriesContextOnTurn(t *testing.T) {
 // still carry its context to the turn on reload — guards the tool-only branch of
 // buildReadModel (the ctx capture lives outside the text-block `if`).
 func TestReadModelContextFromToolOnlyBlock(t *testing.T) {
-	d, created := newReadModelDaemon(t)
+	d, klaxID := newReadModelDaemon(t)
 	items := []history.Item{
 		{Role: "user", Text: "u"},
 		{Role: "assistant", Tools: []history.ToolCall{{Name: "Exec", Label: "$ echo hi"}}, CtxUsed: 142_000, CtxWindow: 258_400},
 	}
-	turns := testRM(d, created, items, false, true)
+	turns := testRM(d, klaxID, items, false)
 	if len(turns) != 1 {
 		t.Fatalf("want 1 turn, got %+v", turns)
 	}
@@ -262,16 +245,34 @@ func TestReadModelContextFromToolOnlyBlock(t *testing.T) {
 	}
 }
 
-// blockID is stable for identical content and includes the turn seq.
-func TestBlockIDStable(t *testing.T) {
-	if a, b := blockID(5, "assistant", "answer", nil), blockID(5, "assistant", "answer", nil); a != b || a == "" {
-		t.Fatalf("blockID not stable: %q vs %q", a, b)
+// Background task notifications arrive as role=user transcript rows inside a running turn;
+// they must stay blocks of that turn rather than start a new one.
+func TestGroupTurnsKeepsTaskNotificationsInTurn(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	const cwd = "/tmp/proj"
+	dir := filepath.Join(home, ".claude", "projects", "-tmp-proj")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if blockID(5, "assistant", "answer", nil) == blockID(6, "assistant", "answer", nil) {
-		t.Fatal("blockID must include the turn seq")
+	lines := strings.Join([]string{
+		`{"type":"user","message":{"role":"user","content":"check <!-- klax-turn:1111111111111111 -->"}}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"waiting"}]}}`,
+		`{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>a</task-id>\n<summary>Monitor event: \"review\"</summary>\n<event>done</event>\n</task-notification>"},"origin":{"kind":"task-notification"}}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"one done"}]}}`,
+		`{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>a</task-id>\n<status>completed</status>\n<summary>Monitor \"review\" stream ended</summary>\n</task-notification>"},"origin":{"kind":"task-notification","producer":"session-task"}}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"all done"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "s1.jsonl"), []byte(lines), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if blockID(5, "assistant", "answer", nil) == blockID(5, "assistant", "other", nil) {
-		t.Fatal("blockID must include the text")
+	items, err := history.Load("claude", "s1", cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := groupTurns(items)
+	if len(g) != 1 || g[0].lead.Marker != "1111111111111111" || len(g[0].blocks) != 5 {
+		t.Fatalf("want one turn with 5 blocks, got %+v", g)
 	}
 }
 
@@ -307,16 +308,16 @@ func TestGroupTurns(t *testing.T) {
 // An aborted queued turn (Last==err, never ran) is surfaced on reload with an error
 // block — shown as stopped, not silently dropped or frozen.
 func TestReadModelAbortedSurfaced(t *testing.T) {
-	d, created := newReadModelDaemon(t)
-	sr := d.getRunner("user:alice", created)
+	d, klaxID := newReadModelDaemon(t)
+	sr := d.getRunner("user:alice", klaxID)
 	seq, _, _, _, err := sr.store.Enqueue("ui:alice", "", "n", "doomed", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := sr.store.MarkErr(seq, "aborted"); err != nil {
+	if err := sr.store.MarkErr(seq, "aborted", 0); err != nil {
 		t.Fatal(err)
 	}
-	turns := testRM(d, created, nil, false, true)
+	turns := testRM(d, klaxID, nil, false)
 	if len(turns) != 1 || turns[0].State != "err" {
 		t.Fatalf("aborted turn not surfaced as err: %+v", turns)
 	}
@@ -341,12 +342,9 @@ func TestErrBlockCanonicalReasons(t *testing.T) {
 		{"backend failed", "backend failed"},
 	}
 	for _, tt := range tests {
-		got := errBlock(11, tt.reason)
+		got := errBlock(tt.reason)
 		if got.Text != tt.want {
 			t.Fatalf("errBlock(%q).Text = %q, want %q", tt.reason, got.Text, tt.want)
-		}
-		if wantID := blockID(11, "error", tt.want, nil); got.ID != wantID {
-			t.Fatalf("errBlock(%q).ID = %q, want %q", tt.reason, got.ID, wantID)
 		}
 	}
 }
@@ -356,15 +354,15 @@ func TestAppendHookWarningsOnlyAddsFinishFailure(t *testing.T) {
 		{Hook: "audit.turn.start", Status: "error", Reason: turnErrAuditStartFailed},
 		{Hook: "audit.turn.finish", Status: "error", Reason: turnWarnAuditFinishFailed, TS: time.Now().UnixNano()},
 	}
-	blocks := appendHookWarnings(nil, 7, failures)
+	blocks := appendHookWarnings(nil, failures)
 	if len(blocks) != 1 || blocks[0].Role != "system" || blocks[0].Kind != "error" {
 		t.Fatalf("hook warnings = %+v", blocks)
 	}
 }
 
 func TestReadModelAbortedKeepsTurnOrder(t *testing.T) {
-	d, created := newReadModelDaemon(t)
-	sr := d.getRunner("user:alice", created)
+	d, klaxID := newReadModelDaemon(t)
+	sr := d.getRunner("user:alice", klaxID)
 	seq1, _, _, _, err := sr.store.Enqueue("ui:alice", "", "n1", "first", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -380,19 +378,19 @@ func TestReadModelAbortedKeepsTurnOrder(t *testing.T) {
 	user1 := bindReadModelTurn(t, sr.store, seq1, 1, "first")
 	user3 := bindReadModelTurn(t, sr.store, seq3, 3, "third")
 	for _, seq := range []int64{seq1, seq3} {
-		if err := sr.store.MarkDone(seq); err != nil {
+		if err := sr.store.MarkDone(seq, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := sr.store.MarkErr(seq2, "aborted"); err != nil {
+	if err := sr.store.MarkErr(seq2, "aborted", 0); err != nil {
 		t.Fatal(err)
 	}
-	turns := testRM(d, created, []history.Item{
+	turns := testRM(d, klaxID, []history.Item{
 		user1,
 		{Role: "assistant", Text: "one"},
 		user3,
 		{Role: "assistant", Text: "three"},
-	}, false, true)
+	}, false)
 	if len(turns) != 3 {
 		t.Fatalf("turn count = %d, want 3: %+v", len(turns), turns)
 	}
@@ -405,21 +403,21 @@ func TestReadModelAbortedKeepsTurnOrder(t *testing.T) {
 }
 
 func TestReadModelUsesTranscriptTerminalError(t *testing.T) {
-	d, created := newReadModelDaemon(t)
-	sr := d.getRunner("user:alice", created)
+	d, klaxID := newReadModelDaemon(t)
+	sr := d.getRunner("user:alice", klaxID)
 	seq, _, _, _, err := sr.store.Enqueue("ui:alice", "", "n1", "work", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	user := bindReadModelTurn(t, sr.store, seq, 1, "work")
-	if err := sr.store.MarkErr(seq, turnErrBackendFailed); err != nil {
+	if err := sr.store.MarkErr(seq, turnErrBackendFailed, 0); err != nil {
 		t.Fatal(err)
 	}
 	const detail = "Selected model is at capacity. (server_overloaded)"
-	turns := testRM(d, created, []history.Item{
+	turns := testRM(d, klaxID, []history.Item{
 		user,
 		{Role: "system", Kind: "error", Text: detail},
-	}, false, true)
+	}, false)
 	if len(turns) != 1 || len(turns[0].Blocks) != 1 {
 		t.Fatalf("terminal error duplicated: %+v", turns)
 	}
@@ -441,14 +439,14 @@ func TestReadModelRecoveredErrorIsNotTheOutcome(t *testing.T) {
 		{"backend failed after recovery", turnErrBackendFailed, true, "Ошибка backend"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			d, created := newReadModelDaemon(t)
-			sr := d.getRunner("user:alice", created)
+			d, klaxID := newReadModelDaemon(t)
+			sr := d.getRunner("user:alice", klaxID)
 			seq, _, _, _, err := sr.store.Enqueue("ui:alice", "", "n1", "work", nil)
 			if err != nil {
 				t.Fatal(err)
 			}
 			user := bindReadModelTurn(t, sr.store, seq, 1, "work")
-			if err := sr.store.MarkErr(seq, tc.reason); err != nil {
+			if err := sr.store.MarkErr(seq, tc.reason, 0); err != nil {
 				t.Fatal(err)
 			}
 			items := []history.Item{
@@ -458,7 +456,7 @@ func TestReadModelRecoveredErrorIsNotTheOutcome(t *testing.T) {
 			if tc.recovered {
 				items = append(items, history.Item{Role: "assistant", Text: "recovered, continuing"})
 			}
-			turns := testRM(d, created, items, false, true)
+			turns := testRM(d, klaxID, items, false)
 			last := turns[0].Blocks[len(turns[0].Blocks)-1]
 			if last.Text != tc.want {
 				t.Fatalf("terminal block = %q, want %q: %+v", last.Text, tc.want, turns[0].Blocks)
@@ -467,10 +465,156 @@ func TestReadModelRecoveredErrorIsNotTheOutcome(t *testing.T) {
 	}
 }
 
-// blockID is canonical: a trailing-whitespace difference (live res.Text vs the trimmed
-// transcript text) must NOT change the id, or the reload-race duplicate final can't dedup.
-func TestBlockIDCanonical(t *testing.T) {
-	if blockID(7, "assistant", "answer", nil) != blockID(7, "assistant", "answer\n\n ", nil) {
-		t.Fatal("blockID must be canonical across trailing whitespace")
+// A turn that never reached the transcript is placed right before the next recorded turn —
+// never glued to the end once newer turns exist.
+func TestReadModelQueueOnlyTurnStaysOnItsPage(t *testing.T) {
+	d, klaxID := newReadModelDaemon(t)
+	sr := d.getRunner("user:alice", klaxID)
+	var seqs []int64
+	for _, text := range []string{"first", "cancelled", "third", "fourth"} {
+		seq, _, _, _, err := sr.store.Enqueue("ui:alice", "", "n"+text, text, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seqs = append(seqs, seq)
+	}
+	var items []history.Item
+	for i, seq := range []int64{seqs[0], seqs[2], seqs[3]} {
+		items = append(items, bindReadModelTurn(t, sr.store, seq, int64(2*i+1), []string{"first", "third", "fourth"}[i]),
+			history.Item{Role: "assistant", Text: "ok", Event: int64(2*i + 2)})
+		if err := sr.store.MarkDone(seq, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := sr.store.MarkErr(seqs[1], turnErrCancelled, 0); err != nil {
+		t.Fatal(err)
+	}
+	q, _ := sr.store.InboundLog()
+	all := d.buildReadModel("user:alice", klaxID, groupTurns(items), q, false, nil)
+	if len(all) != 4 || all[1].Seq != seqs[1] || all[1].State != "err" || all[1].Blocks[0].Kind != "cancelled" || all[1].Blocks[0].Text != "Отменено" {
+		t.Fatalf("cancelled turn = %+v", all)
+	}
+}
+
+// A memoized build equals a from-scratch build at every step of a session's life — queued,
+// running with growing blocks and amended usage, finished, errored — and reuses the rows of
+// turns the step did not touch.
+func TestReadModelMemoMatchesFullBuild(t *testing.T) {
+	d, klaxID := newReadModelDaemon(t)
+	sr := d.getRunner("user:alice", klaxID)
+	var items []history.Item
+	memo := &rowMemo{}
+	check := func(step string, busy bool) []uiTurn {
+		t.Helper()
+		q, _ := sr.store.InboundLog()
+		memo = &rowMemo{prev: memo.next}
+		got := d.buildReadModel("user:alice", klaxID, groupTurns(items), q, busy, memo)
+		want := d.buildReadModel("user:alice", klaxID, groupTurns(items), q, busy, nil)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s: memoized rows differ\n got %+v\nwant %+v", step, got, want)
+		}
+		return got
+	}
+	for i, text := range []string{"one", "two"} {
+		seq, _, _, _, err := sr.store.Enqueue("ui:alice", "", "n"+text, text, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		check(text+" queued", i == 1)
+		items = append(items, bindReadModelTurn(t, sr.store, seq, int64(len(items)), text))
+		check(text+" running", true)
+		for b := 0; b < 3; b++ {
+			items = append(items, history.Item{Role: "assistant", Tools: []history.ToolCall{{Name: "Exec", Label: fmt.Sprint(text, b)}}})
+			check(fmt.Sprint(text, " block ", b), true)
+			items[len(items)-1].CtxUsed = 100 * (b + 1)
+			check(fmt.Sprint(text, " usage ", b), true)
+		}
+		items = append(items, history.Item{Role: "assistant", Text: "answer " + text})
+		check(text+" answer while running", true)
+		if i == 0 {
+			if err := sr.store.MarkDone(seq, 0); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := sr.store.MarkErr(seq, turnErrBackendFailed, 0); err != nil {
+			t.Fatal(err)
+		}
+		check(text+" finished", false)
+	}
+	prev := check("unchanged", false)
+	items = append(items, history.Item{Role: "system", Text: "notice"})
+	rows := check("appended notice", false)
+	if &rows[0].Blocks[0] != &prev[0].Blocks[0] {
+		t.Fatal("an untouched turn was rebuilt")
+	}
+}
+
+// A row whose file link could not be published yet is rebuilt, not kept: the link appears once
+// the file exists, as it would in a from-scratch build.
+func TestReadModelMemoRetriesDegradedLink(t *testing.T) {
+	// Must precede the first t.TempDir: macOS defaults to /var/folders/…, outside the session cwd /tmp.
+	t.Setenv("TMPDIR", "/tmp")
+	d, klaxID := newReadModelDaemon(t)
+	sr := d.getRunner("user:alice", klaxID)
+	seq, _, _, _, err := sr.store.Enqueue("ui:alice", "", "n", "q", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := filepath.Join(t.TempDir(), "report.txt") // under the session cwd /tmp
+	items := []history.Item{
+		bindReadModelTurn(t, sr.store, seq, 0, "q"),
+		{Role: "assistant", Text: "see [r](" + report + ")"},
+	}
+	if err := sr.store.MarkDone(seq, 0); err != nil {
+		t.Fatal(err)
+	}
+	q, _ := sr.store.InboundLog()
+	build := func(memo *rowMemo) string {
+		return d.buildReadModel("user:alice", klaxID, groupTurns(items), q, false, memo)[0].Blocks[0].Text
+	}
+	first := &rowMemo{}
+	if got := build(first); strings.Contains(got, "/api/file") || len(first.next) != 0 {
+		t.Fatalf("missing file: text %q, memoized %d rows", got, len(first.next))
+	}
+	if err := os.WriteFile(report, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := build(&rowMemo{prev: first.next}); !strings.Contains(got, "/api/file?ref=") {
+		t.Fatalf("link not published after the file appeared: %q", got)
+	}
+}
+
+// An attachment whose link could not be written is retried by the next build, not memoized.
+func TestReadModelMemoRetriesUnpublishedAttachment(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root ignores directory modes")
+	}
+	d, klaxID := newReadModelDaemon(t)
+	sr := d.getRunner("user:alice", klaxID)
+	seq, _, _, _, err := sr.store.Enqueue("ui:alice", "", "n", "q", []sessfiles.NamedReader{{Name: "a.txt", R: strings.NewReader("x")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := []history.Item{bindReadModelTurn(t, sr.store, seq, 0, "q")}
+	if err := sr.store.MarkDone(seq, 0); err != nil {
+		t.Fatal(err)
+	}
+	q, _ := sr.store.InboundLog()
+	build := func(memo *rowMemo) string {
+		return d.buildReadModel("user:alice", klaxID, groupTurns(items), q, false, memo)[0].Text
+	}
+	dir := filepath.Dir(filepath.Dir(sr.store.Path("x"))) // the session dir holding links.json
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	first := &rowMemo{}
+	got := build(first)
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, "/api/file") || len(first.next) != 0 {
+		t.Fatalf("unwritable links: text %q, memoized %d rows", got, len(first.next))
+	}
+	if got := build(&rowMemo{prev: first.next}); !strings.Contains(got, "/api/file?ref=") {
+		t.Fatalf("attachment not linked once links were writable: %q", got)
 	}
 }

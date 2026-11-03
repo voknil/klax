@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"time"
 
@@ -19,15 +20,16 @@ import (
 var ErrRemoved = errors.New("sessfiles: session store removed")
 
 // queue.jsonl is the per-session durable queue AND the session-lifetime inbound
-// log: append-only records enq → run → done/err, never deleted. fsync on every
-// append; enq is the durability point (a turn's files are fsynced first). Replay
+// log: append-only records reserve → enq → run → done/err, never deleted. fsync on every
+// append; reserve burns the sequence before files are written, and enq accepts the turn.
+// A turn's files are fsynced first. Replay
 // re-enqueues enq-without-run and flags run-without-terminal for transcript
 // reconciliation. `turn_seq` is the monotonic canonical turn id. Legacy enqueues
 // may carry a prompt marker; new runs bind to physical transcript coordinates.
 
 type record struct {
-	Ev           string         `json:"ev"` // enq|run|run_session|bind|done|err|hook
-	Seq          int64          `json:"seq"`
+	Ev           string         `json:"ev"` // reserve|enq|run|run_session|bind|done|err|hook
+	Seq          int64          `json:"turn_seq"`
 	ChatID       string         `json:"chat,omitempty"` // originating chat, for replay delivery
 	MsgID        string         `json:"msg,omitempty"`
 	Nonce        string         `json:"nonce,omitempty"`
@@ -37,15 +39,17 @@ type record struct {
 	Marker       string         `json:"marker,omitempty"`
 	TS           int64          `json:"ts,omitempty"`
 	Reason       string         `json:"reason,omitempty"`
+	CtxWindow    int            `json:"ctx_window,omitempty"`
 	Hook         string         `json:"hook,omitempty"`
 	Status       string         `json:"status,omitempty"`
 	Backend      string         `json:"backend,omitempty"`
-	Session      string         `json:"session,omitempty"`
+	BackendID    string         `json:"backend_id,omitempty"`
 	PromptDigest string         `json:"prompt_digest,omitempty"`
 	FromEvent    int64          `json:"from_event,omitempty"`
 	Event        *int64         `json:"event,omitempty"`
 	RecordDigest string         `json:"record_digest,omitempty"`
 	Origin       inbound.Origin `json:"origin,omitempty"`
+	Read         bool           `json:"read,omitempty"` // the sender already read the message
 }
 
 // Turn is a reconstructed inbound message: its enq fields plus its latest state.
@@ -61,15 +65,17 @@ type Turn struct {
 	TS           int64
 	Last         string // enq|run|done|err
 	Reason       string
+	CtxWindow    int // context window the turn ran with, from its terminal record
 	HookFailures []HookFailure
 	Backend      string
-	Session      string
+	BackendID    string
 	PromptDigest string
 	FromEvent    int64
 	Bound        bool
 	Event        int64
 	RecordDigest string
 	Origin       inbound.Origin
+	Read         bool
 	enqueued     bool
 }
 
@@ -108,14 +114,14 @@ func (s *Store) QueueStat() (time.Time, int64) {
 // Holds the durable-store lock across the whole acceptance, so turn_seq allocation,
 // file writes and the enq append are one atomic unit.
 func (s *Store) Enqueue(chatID, msgID, nonce, text string, files []NamedReader) (seq int64, marker string, stored []string, duplicate bool, err error) {
-	seq, marker, stored, duplicate, _, err = s.EnqueueOrigin(chatID, msgID, nonce, text, text, files, inbound.Origin{})
+	seq, marker, stored, duplicate, _, err = s.EnqueueOrigin(chatID, msgID, nonce, text, text, files, inbound.Origin{}, false)
 	return
 }
 
 // EnqueueOrigin is Enqueue plus the normalized immutable message origin needed
 // by consumers at run time, including after durable replay. acceptedAt is the
-// exact timestamp written to the enq record.
-func (s *Store) EnqueueOrigin(chatID, msgID, nonce, text, originalText string, files []NamedReader, origin inbound.Origin) (seq int64, marker string, stored []string, duplicate bool, acceptedAt int64, err error) {
+// exact timestamp written to the enq record. read records that the sender already read the message.
+func (s *Store) EnqueueOrigin(chatID, msgID, nonce, text, originalText string, files []NamedReader, origin inbound.Origin, read bool) (seq int64, marker string, stored []string, duplicate bool, acceptedAt int64, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.removed {
@@ -136,8 +142,11 @@ func (s *Store) EnqueueOrigin(chatID, msgID, nonce, text, originalText string, f
 			}
 		}
 	}
-	s.seq++ // reserve first: a failure below just burns the seq (gaps are fine)
+	s.seq++
 	seq = s.seq
+	if err = s.appendRecord(record{Ev: "reserve", Seq: seq}); err != nil {
+		return
+	}
 	for i, f := range files {
 		var name string
 		if name, err = s.WriteFile(seq, i+1, f.Name, f.R); err != nil {
@@ -146,23 +155,23 @@ func (s *Store) EnqueueOrigin(chatID, msgID, nonce, text, originalText string, f
 		stored = append(stored, name)
 	}
 	acceptedAt = time.Now().UnixNano()
-	err = s.appendRecord(record{Ev: "enq", Seq: seq, ChatID: chatID, MsgID: msgID, Nonce: nonce, Text: text, OriginalText: originalText, Files: stored, Marker: marker, TS: acceptedAt, Origin: origin})
+	err = s.appendRecord(record{Ev: "enq", Seq: seq, ChatID: chatID, MsgID: msgID, Nonce: nonce, Text: text, OriginalText: originalText, Files: stored, Marker: marker, TS: acceptedAt, Origin: origin, Read: read})
 	return
 }
 
 // MarkRun/MarkDone/MarkErr append progress/terminal records for a turn.
 func (s *Store) MarkRun(seq int64) error { return s.mark(record{Ev: "run", Seq: seq}) }
-func (s *Store) MarkRunMeta(seq int64, backend, session, promptDigest string, fromEvent int64) error {
-	return s.mark(record{Ev: "run", Seq: seq, Backend: backend, Session: session, PromptDigest: promptDigest, FromEvent: fromEvent})
+func (s *Store) MarkRunMeta(seq int64, backend, backendID, promptDigest string, fromEvent int64) error {
+	return s.mark(record{Ev: "run", Seq: seq, Backend: backend, BackendID: backendID, PromptDigest: promptDigest, FromEvent: fromEvent})
 }
-func (s *Store) MarkRunSession(seq int64, backend, session string, fromEvent int64) error {
-	return s.mark(record{Ev: "run_session", Seq: seq, Backend: backend, Session: session, FromEvent: fromEvent})
+func (s *Store) MarkRunSession(seq int64, backend, backendID string, fromEvent int64) error {
+	return s.mark(record{Ev: "run_session", Seq: seq, Backend: backend, BackendID: backendID, FromEvent: fromEvent})
 }
 
 var ErrBindConflict = errors.New("sessfiles: transcript binding conflict")
 
 // Bind establishes an immutable one-to-one queue/transcript association.
-func (s *Store) Bind(seq int64, backend, session string, event int64, recordDigest string) error {
+func (s *Store) Bind(seq int64, backend, backendID string, event int64, recordDigest string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	turns, err := s.turns()
@@ -172,7 +181,7 @@ func (s *Store) Bind(seq int64, backend, session string, event int64, recordDige
 	var target *Turn
 	for i := range turns {
 		t := &turns[i]
-		if t.Bound && t.Backend == backend && t.Session == session && t.Event == event {
+		if t.Bound && t.Backend == backend && t.BackendID == backendID && t.Event == event {
 			if t.Seq == seq && t.RecordDigest == recordDigest {
 				return nil
 			}
@@ -182,25 +191,27 @@ func (s *Store) Bind(seq int64, backend, session string, event int64, recordDige
 			target = t
 		}
 	}
-	if target == nil || target.Backend != backend || target.Session != session {
+	if target == nil || target.Backend != backend || target.BackendID != backendID {
 		return ErrBindConflict
 	}
 	if target.Bound {
 		return ErrBindConflict
 	}
 	for _, t := range turns {
-		if !t.Bound || t.Backend != backend || t.Session != session {
+		if !t.Bound || t.Backend != backend || t.BackendID != backendID {
 			continue
 		}
 		if (t.Seq < seq && t.Event >= event) || (t.Seq > seq && t.Event <= event) {
 			return ErrBindConflict
 		}
 	}
-	return s.appendRecord(record{Ev: "bind", Seq: seq, Backend: backend, Session: session, Event: &event, RecordDigest: recordDigest, TS: time.Now().UnixNano()})
+	return s.appendRecord(record{Ev: "bind", Seq: seq, Backend: backend, BackendID: backendID, Event: &event, RecordDigest: recordDigest, TS: time.Now().UnixNano()})
 }
-func (s *Store) MarkDone(seq int64) error { return s.mark(record{Ev: "done", Seq: seq}) }
-func (s *Store) MarkErr(seq int64, reason string) error {
-	return s.mark(record{Ev: "err", Seq: seq, Reason: reason})
+func (s *Store) MarkDone(seq int64, ctxWindow int) error {
+	return s.mark(record{Ev: "done", Seq: seq, CtxWindow: ctxWindow})
+}
+func (s *Store) MarkErr(seq int64, reason string, ctxWindow int) error {
+	return s.mark(record{Ev: "err", Seq: seq, Reason: reason, CtxWindow: ctxWindow})
 }
 func (s *Store) MarkHookError(seq int64, hook, reason string) error {
 	return s.mark(record{Ev: "hook", Seq: seq, Hook: hook, Status: "error", Reason: reason})
@@ -244,96 +255,136 @@ func (s *Store) InboundLog() ([]Turn, error) {
 	return s.turns()
 }
 
-// turns folds queue.jsonl records into per-seq Turns (latest state). Caller holds mu.
+// turns returns the per-seq Turns (latest state) in turn_seq order, as a copy the caller may
+// modify. Caller holds mu.
 func (s *Store) turns() ([]Turn, error) {
-	recs, err := s.readRecords()
-	if err != nil {
+	if err := s.refreshQueue(); err != nil {
 		return nil, err
 	}
-	byseq := map[int64]*Turn{}
-	for _, r := range recs {
-		t := byseq[r.Seq]
-		if t == nil {
-			t = &Turn{Seq: r.Seq}
-			byseq[r.Seq] = t
-		}
-		switch r.Ev {
-		case "enq":
-			t.ChatID, t.MsgID, t.Nonce, t.Text, t.Files, t.Marker, t.TS, t.Last =
-				r.ChatID, r.MsgID, r.Nonce, r.Text, r.Files, r.Marker, r.TS, "enq"
-			t.OriginalText = r.OriginalText
-			if t.OriginalText == "" {
-				t.OriginalText = r.Text
-			}
-			t.Origin = r.Origin
-			t.enqueued = true
-		case "run":
-			t.Last, t.Reason = r.Ev, r.Reason
-			t.Backend, t.Session, t.PromptDigest, t.FromEvent = r.Backend, r.Session, r.PromptDigest, r.FromEvent
-		case "run_session":
-			if r.Backend != "" {
-				t.Backend = r.Backend
-			}
-			t.Session, t.FromEvent = r.Session, r.FromEvent
-		case "bind":
-			if !t.Bound && r.Event != nil && t.Backend == r.Backend && t.Session == r.Session {
-				t.Bound, t.Event, t.RecordDigest = true, *r.Event, r.RecordDigest
-			}
-		case "done", "err":
-			t.Last, t.Reason = r.Ev, r.Reason
-		case "hook":
-			if r.Status != "error" {
-				continue
-			}
-			t.HookFailures = append(t.HookFailures, HookFailure{
-				Hook: r.Hook, Status: r.Status, Reason: r.Reason, TS: r.TS,
-			})
-			if r.Hook == "audit.turn.start" {
-				t.Last, t.Reason = "err", r.Reason
-			}
-		}
+	out := slices.Clone(s.queue.turns)
+	for i := range out {
+		out[i].Files, out[i].HookFailures = slices.Clone(out[i].Files), slices.Clone(out[i].HookFailures)
 	}
-	out := make([]Turn, 0, len(byseq))
-	for _, t := range byseq {
-		if !t.enqueued { // no enq seen for this seq (torn/partial) — skip
-			continue
-		}
-		out = append(out, *t)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
 	return out, nil
 }
 
-// readRecords scans queue.jsonl with a bufio.Reader (never a Scanner — matches the
-// codebase rule and tolerates arbitrarily long lines). A torn trailing line from a
-// crash mid-append fails to unmarshal and is skipped. Caller holds mu.
-func (s *Store) readRecords() ([]record, error) {
+// queueProjection is queue.jsonl folded into per-seq Turns. queue.jsonl only grows, so the
+// projection reads just the complete records appended since the last read; a path that now
+// holds another file, or a shorter one, is folded again from zero.
+type queueProjection struct {
+	info   os.FileInfo
+	offset int64
+	byseq  map[int64]*Turn
+	maxSeq int64
+	turns  []Turn // sorted snapshot of byseq, rebuilt when a record is folded
+}
+
+// refreshQueue folds the records appended to queue.jsonl since the last call. A torn line
+// from a crash mid-append fails to unmarshal and is skipped; a complete record whose newline
+// was lost counts, as appendRecord only terminates it before the next one. Caller holds mu.
+func (s *Store) refreshQueue() error {
+	q := &s.queue
 	f, err := os.Open(s.queuePath())
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			*q = queueProjection{}
+			return nil
 		}
-		return nil, err
+		return err
 	}
 	defer f.Close()
-	var recs []record
-	br := bufio.NewReader(f)
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if q.info != nil && os.SameFile(fi, q.info) && fi.Size() == q.info.Size() && fi.ModTime().Equal(q.info.ModTime()) {
+		return nil
+	}
+	if q.info == nil || !os.SameFile(fi, q.info) || fi.Size() < q.offset {
+		*q = queueProjection{byseq: map[int64]*Turn{}}
+	}
+	br := bufio.NewReader(io.NewSectionReader(f, q.offset, fi.Size()-q.offset))
+	folded := false
 	for {
 		line, rerr := br.ReadBytes('\n')
-		if t := bytes.TrimRight(line, "\n"); len(t) > 0 {
-			var r record
-			if json.Unmarshal(t, &r) == nil {
-				recs = append(recs, r)
-			}
+		if rerr != nil && rerr != io.EOF {
+			q.info = nil
+			return rerr
 		}
-		if rerr != nil {
-			if rerr == io.EOF {
-				break
-			}
-			return nil, rerr
+		var r record
+		valid := json.Unmarshal(bytes.TrimRight(line, "\n"), &r) == nil
+		if rerr == io.EOF && !valid {
+			break // an unterminated partial record is read once it is complete
+		}
+		q.offset += int64(len(line))
+		if valid {
+			q.fold(r)
+			folded = true
+		}
+		if rerr == io.EOF {
+			break
 		}
 	}
-	return recs, nil
+	q.info = fi
+	if folded || q.turns == nil {
+		q.turns = make([]Turn, 0, len(q.byseq))
+		for _, t := range q.byseq {
+			if t.enqueued { // no enq seen for this seq (torn/partial) — skip
+				q.turns = append(q.turns, *t)
+			}
+		}
+		sort.Slice(q.turns, func(i, j int) bool { return q.turns[i].Seq < q.turns[j].Seq })
+	}
+	return nil
+}
+
+func (q *queueProjection) fold(r record) {
+	if r.Seq > q.maxSeq {
+		q.maxSeq = r.Seq
+	}
+	if r.Ev == "reserve" {
+		return
+	}
+	t := q.byseq[r.Seq]
+	if t == nil {
+		t = &Turn{Seq: r.Seq}
+		q.byseq[r.Seq] = t
+	}
+	switch r.Ev {
+	case "enq":
+		t.ChatID, t.MsgID, t.Nonce, t.Text, t.Files, t.Marker, t.TS, t.Last =
+			r.ChatID, r.MsgID, r.Nonce, r.Text, r.Files, r.Marker, r.TS, "enq"
+		t.OriginalText = r.OriginalText
+		if t.OriginalText == "" {
+			t.OriginalText = r.Text
+		}
+		t.Origin, t.Read = r.Origin, r.Read
+		t.enqueued = true
+	case "run":
+		t.Last, t.Reason = r.Ev, r.Reason
+		t.Backend, t.BackendID, t.PromptDigest, t.FromEvent = r.Backend, r.BackendID, r.PromptDigest, r.FromEvent
+	case "run_session":
+		if r.Backend != "" {
+			t.Backend = r.Backend
+		}
+		t.BackendID, t.FromEvent = r.BackendID, r.FromEvent
+	case "bind":
+		if !t.Bound && r.Event != nil && t.Backend == r.Backend && t.BackendID == r.BackendID {
+			t.Bound, t.Event, t.RecordDigest = true, *r.Event, r.RecordDigest
+		}
+	case "done", "err":
+		t.Last, t.Reason, t.CtxWindow = r.Ev, r.Reason, r.CtxWindow
+	case "hook":
+		if r.Status != "error" {
+			return
+		}
+		t.HookFailures = append(t.HookFailures, HookFailure{
+			Hook: r.Hook, Status: r.Status, Reason: r.Reason, TS: r.TS,
+		})
+		if r.Hook == "audit.turn.start" {
+			t.Last, t.Reason = "err", r.Reason
+		}
+	}
 }
 
 // appendRecord writes one fsynced JSON line to queue.jsonl. Caller holds mu.
@@ -388,15 +439,10 @@ func (s *Store) ensureLoaded() error {
 	if s.loaded {
 		return nil
 	}
-	recs, err := s.readRecords()
-	if err != nil {
+	if err := s.refreshQueue(); err != nil {
 		return err
 	}
-	for _, r := range recs {
-		if r.Seq > s.seq {
-			s.seq = r.Seq
-		}
-	}
+	s.seq = max(s.seq, s.queue.maxSeq)
 	s.loaded = true
 	return nil
 }
