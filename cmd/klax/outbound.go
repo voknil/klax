@@ -19,6 +19,20 @@ import (
 // whitespace-free href.
 var outLinkRe = regexp.MustCompile(`(!?)\[([^\]]*)\]\(([^)\s]+)\)`)
 
+// outCitationRe matches the file directive codex emits instead of a markdown
+// link: :codex-file-citation{path="/abs/path" purpose="output"}. The path is
+// raw (not url-escaped) and may contain spaces or non-ASCII.
+var outCitationRe = regexp.MustCompile(`:codex-file-citation\{[^}]*?path="([^"]+)"[^}]*\}`)
+
+// stripFileCitations removes codex file directives from chat text once the
+// files they name are delivered as attachments.
+func stripFileCitations(md string) string {
+	if !strings.Contains(md, ":codex-file-citation{") {
+		return md
+	}
+	return strings.TrimSpace(outCitationRe.ReplaceAllString(md, ""))
+}
+
 // maxOutboundFiles caps how many local files one answer can publish (a budget, not a
 // security boundary — confinement does that).
 const maxOutboundFiles = 16
@@ -67,16 +81,23 @@ func (d *daemon) outboundFilesEnabled() bool {
 // confinement rule as the web UI is used: only existing files below the
 // session working directory are eligible for upload.
 func outboundFileRefs(md, cwd string) []outboundFileRef {
-	if md == "" || cwd == "" || !strings.Contains(md, "](") {
+	if md == "" || cwd == "" || (!strings.Contains(md, "](") && !strings.Contains(md, ":codex-file-citation{")) {
 		return nil
+	}
+	var hrefs []string
+	for _, m := range outLinkRe.FindAllStringSubmatch(md, -1) {
+		hrefs = append(hrefs, m[3])
+	}
+	for _, m := range outCitationRe.FindAllStringSubmatch(md, -1) {
+		// The directive's path is raw; escape it so outboundPath's unescape is a no-op.
+		hrefs = append(hrefs, (&url.URL{Path: m[1]}).EscapedPath())
 	}
 	seen := make(map[string]bool)
 	var out []outboundFileRef
-	for _, m := range outLinkRe.FindAllStringSubmatch(md, -1) {
+	for _, href := range hrefs {
 		if len(out) >= maxOutboundFiles {
 			break
 		}
-		href := m[3]
 		if isRemoteHref(href) {
 			continue
 		}
@@ -153,65 +174,72 @@ func outboundFileAllowed(path string) bool {
 }
 
 // rewriteOutboundForUI rewrites an agent answer's local file links to /api/file?ref= capability
-// URLs. A link that cannot be confined or snapshotted degrades to its plain label. UI-only.
-func (d *daemon) rewriteOutboundForUI(sk string, created, turnSeq int64, md string) string {
+// URLs. A link that cannot be confined or snapshotted degrades to its plain label; published
+// reports whether none did, so a caller may keep the result. UI-only.
+func (d *daemon) rewriteOutboundForUI(sk, klaxID string, turnSeq int64, md string) (out string, published bool) {
 	if d.uiHub == nil || md == "" || !strings.Contains(md, "](") {
-		return md
+		return md, true
 	}
 	// Store first, then liveness: closeSession deletes the session before dropping the runner, so a
 	// missing session here means a concurrent close won.
-	store := d.sessionStore(sk, created)
-	sess := d.store.Get(sk, created)
+	store := d.sessionStore(sk, klaxID)
+	sess := d.store.Get(sk, klaxID)
 	if sess == nil {
-		return md
+		return md, false
 	}
 	roots := []string{sess.CWD}
 	n := 0
-	return outLinkRe.ReplaceAllStringFunc(md, func(m string) string {
+	published = true
+	degrade := func(label string) string {
+		published = false
+		return label
+	}
+	out = outLinkRe.ReplaceAllStringFunc(md, func(m string) string {
 		sub := outLinkRe.FindStringSubmatch(m)
 		bang, label, href := sub[1], sub[2], sub[3]
 		if isRemoteHref(href) {
 			return m // http(s)/data/anchor/already-ours: leave untouched
 		}
 		if n >= maxOutboundFiles {
-			return label
+			return degrade(label)
 		}
 		key, keyOK := outboundKey(turnSeq, href, sess.CWD)
 		if keyOK {
 			if stored, ok := store.SourceStored(key); ok {
-				if out, ok := d.storedHref(store, sk, created, stored, bang, label); ok {
+				if out, ok := d.storedHref(store, sk, klaxID, stored, bang, label); ok {
 					n++
 					return out
 				}
-				return label
+				return degrade(label)
 			}
 		}
 		// Not snapshotted yet: the one point the original is read, and where confinement applies.
 		real, ok := resolveInRoot(href, sess.CWD, roots)
 		if !ok {
-			return label // outside any root / malformed: degrade to text, never a dead link
+			return degrade(label) // outside any root / malformed: degrade to text, never a dead link
 		}
 		stored, fi, err := store.Adopt(filepath.Base(real), real)
 		if err != nil {
-			return label
+			return degrade(label)
 		}
 		// Token, turn mapping and content identity are one durable write, not three.
-		token, err := d.commitLink(store, sk, created, sessfiles.LinkRecord{
+		token, err := d.commitLink(store, sk, klaxID, sessfiles.LinkRecord{
 			Blob: stored, Name: sessfiles.DisplayName(stored),
 			ContentType: mime.TypeByExtension(filepath.Ext(stored)),
 			Source:      key, SeenPath: real, SeenInfo: fi,
 		})
 		if err != nil {
-			return label // a link that cannot be re-resolved later is not published
+			return degrade(label) // a link that cannot be re-resolved later is not published
 		}
 		n++
 		return renderHref(store, stored, token, bang, label)
 	})
+	return out, published
 }
 
 // storedHref renders an already-published blob as its markdown link.
-func (d *daemon) storedHref(store *sessfiles.Store, sk string, created int64, stored, bang, label string) (string, bool) {
-	token, err := d.fileToken(store, sk, created, stored, sessfiles.DisplayName(stored), mime.TypeByExtension(filepath.Ext(stored)))
+func (d *daemon) storedHref(store *sessfiles.Store, sk string, klaxID string, stored, bang, label string) (string, bool) {
+	token, err := d.fileToken(store, sk, klaxID, stored, sessfiles.DisplayName(stored), mime.TypeByExtension(filepath.Ext(stored)))
 	if err != nil {
 		return "", false
 	}
@@ -260,6 +288,17 @@ func outboundPath(href, cwd string) (string, bool) {
 	dec, err := url.PathUnescape(href)
 	if err != nil {
 		dec = href
+	}
+	// Codex links files inside its own sandbox as "sandbox:/abs/path" — its own
+	// convention, not a real URI scheme. Left unstripped, "sandbox:/..." fails
+	// filepath.IsAbs (it doesn't start with "/"), gets joined onto cwd into a
+	// path that never exists, and the link is silently dropped: Claude never
+	// emits this prefix, so only codex-backed sessions hit it. Compare only the
+	// ASCII prefix itself (not a lowered copy of the whole string) so a non-ASCII
+	// filename after it can't shift the byte offset used to strip the prefix.
+	const sandboxPrefix = "sandbox:"
+	if len(dec) >= len(sandboxPrefix) && strings.EqualFold(dec[:len(sandboxPrefix)], sandboxPrefix) {
+		dec = dec[len(sandboxPrefix):]
 	}
 	if strings.HasPrefix(dec, "~") || strings.HasPrefix(strings.ToLower(dec), "file:") {
 		return "", false

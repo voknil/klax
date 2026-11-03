@@ -10,7 +10,10 @@ import { mdSafe, esc, fmtTime, fmtDate } from "./markdown.js";
 
 // blockCls is the ONE mapping from a row to its visual class, for grouped blocks and standalone
 // rows alike. kind wins over role: an error row keeps the error class whatever role carries it.
-function blockCls(b){ return b.kind === "error" || b.role === "error" ? "error" : b.role === "tool" ? "tool" : b.role === "system" ? "system" : "assistant"; }
+// answerBlock says whether a block takes part in unread/read-advance: a cancelled note is the user's
+// own action and may sit on a later turn than the one still running, so it never moves the watermark.
+export function answerBlock(b){ return !b || b.kind !== "cancelled"; }
+function blockCls(b){ return b.kind === "cancelled" ? "cancelled" : b.kind === "error" || b.role === "error" ? "error" : b.role === "tool" ? "tool" : b.role === "system" ? "system" : "assistant"; }
 function contextText(used, window){
   if(!used) return "";
   const uk = Math.floor(used / 1000) + "k";
@@ -27,24 +30,35 @@ function contextText(used, window){
 // POS_MULT, so pos() is monotonic and collision-free; parse/decode bridge the "<turn>.<block>"
 // wire form the server persists. Legacy markerless turns have a negative seq ⇒ their positions sort
 // before any real watermark ⇒ always "read", exactly as the server's unreadAfter treats them.
+// Block -1 is the turn's user message: unread unless the writer typed it in the web UI (`read`) and
+// the viewer is that writer.
 export const POS_MULT = 1e6;
 export function pos(turn, block){ return turn * POS_MULT + block; }
+function userReadable(t, readOnly){ return readOnly || !t.read; }
+// readPositions is the ONE list of a row's unread-bearing positions, in order: the user message
+// (when readable), then each answer block. Standalone rows have none.
+export function readPositions(t, readOnly){
+  if(!t || t.role !== "user" || t.turn_seq === undefined) return [];
+  const out = userReadable(t, readOnly) ? [pos(t.turn_seq, -1)] : [];
+  (t.blocks || []).forEach((b, i) => { if(answerBlock(b)) out.push(pos(t.turn_seq, i)); });
+  return out;
+}
 export function parsePos(s){
   const i = String(s || "").indexOf(".");
   if(i < 0) return 0;
   return pos(parseInt(String(s).slice(0, i), 10) || 0, parseInt(String(s).slice(i + 1), 10) || 0);
 }
-export function decodePos(p){ p = p || 0; return { turn: Math.floor(p / POS_MULT), block: p % POS_MULT }; }
+export function decodePos(p){ p = p || 0; const turn = Math.floor((p + 1) / POS_MULT); return { turn, block: p - turn * POS_MULT }; }
 
 // renderModel computes the ordered render items for one session. PURE and unit-testable.
-// The unread divider stays turn-aware: user bubbles are the human's own messages and do not count
-// as unread; standalone non-durable rows are not counted and just flow to the right
-// side of the divider by document order; unread answer blocks land inside the turn at the exact
-// block boundary. `watermark` is the encoded read position (pos()); undefined ⇒ no divider.
+// The unread divider stays turn-aware: a readable user bubble (see userReadable) carries its own
+// data-pos and may open the divider; standalone non-durable rows are not counted and
+// just flow to the right side of the divider by document order; unread answer blocks land inside
+// the turn at the exact block boundary. `watermark` is the encoded read position (pos()); undefined ⇒ no divider.
 // `holdSplits` preserves group boundaries that used to be separated by the unread divider for one
 // live frame after the divider disappears. That lets the line fade out before the two bubble pieces
 // merge back into one.
-export function renderModel(turns, watermark, holdSplits, joinHeldSplits){
+export function renderModel(turns, watermark, holdSplits, joinHeldSplits, ctxWindowHint, readOnly){
   const items = [];
   let queuePos = 0, divided = false;
   // The last context we actually know — the most recent turn's own measured value (the exact
@@ -57,18 +71,20 @@ export function renderModel(turns, watermark, holdSplits, joinHeldSplits){
     if(t.role !== "user"){
       // System notices belong exclusively to the notification stack, never the timeline.
       if(t.role === "notice") continue;
-      // `key` is the standalone's live eventSeq (render-key stability only); it carries no data-pos
-      // so it never drives read-advance, and it is not counted as unread.
-      items.push({ kind: "bubble", cls: blockCls(t), text: t.text || "", md: t.role !== "tool", time: t.time, key: t.eventSeq });
+      // A standalone carries no data-pos, so it never drives read-advance and is not counted as unread.
+      items.push({ kind: "bubble", key: t.key, cls: blockCls(t), text: t.text || "", md: t.role !== "tool", time: t.time });
       continue;
     }
     const blocks_ = t.blocks || [];
     const groups = [];
-    const held = holdSplits && holdSplits.get && holdSplits.get(t.seq);
+    const userPos = userReadable(t, readOnly) ? pos(t.turn_seq, -1) : undefined;
+    const dividerBefore = userPos !== undefined && !divided && unread(userPos);
+    if(dividerBefore) divided = true;
+    const held = holdSplits && holdSplits.get && holdSplits.get(t.turn_seq);
     let i = 0;
     let lastGroupTime = t.time;
     while(i < blocks_.length){
-      if(unread(pos(t.seq, i)) && !divided && has){
+      if(unread(pos(t.turn_seq, i)) && answerBlock(blocks_[i]) && !divided && has){
         groups.push({ divider: true });
         divided = true;
         continue;
@@ -76,16 +92,16 @@ export function renderModel(turns, watermark, holdSplits, joinHeldSplits){
       const cls = blockCls(blocks_[i]), blocks = [];
       const groupStart = i;
       while(i < blocks_.length && blockCls(blocks_[i]) === cls){
-        if(held && i > groupStart && held.has(pos(t.seq, i))) break;
-        if(unread(pos(t.seq, i)) && !divided && has && blocks.length > 0) break;
+        if(held && i > groupStart && held.has(pos(t.turn_seq, i))) break;
+        if(unread(pos(t.turn_seq, i)) && answerBlock(blocks_[i]) && !divided && has && blocks.length > 0) break;
         blocks.push(blocks_[i]); i++;
       }
       const last = blocks.length ? blocks[blocks.length - 1] : {};
-      const startPos = pos(t.seq, i - blocks.length);
+      const startPos = pos(t.turn_seq, i - blocks.length);
       const group = {
         cls, blocks, tool: cls === "tool", time: last.time,
         startPos,
-        maxPos: pos(t.seq, i - 1), // the last block's position — drives read-advance (data-pos)
+        maxPos: answerBlock(last) ? pos(t.turn_seq, i - 1) : 0, // the last block's position — drives read-advance (data-pos)
       };
       groups.push(group);
       if(group.time) lastGroupTime = group.time;
@@ -107,14 +123,16 @@ export function renderModel(turns, watermark, holdSplits, joinHeldSplits){
     // the gap, still the bottom line. A running turn with no tokens of its own yet falls back to
     // lastCtx — the previous turn's final value, already known and already shown on its line.
     // It is NOT a group — buildItem renders it after the dots indicator.
-    const finalCtx = contextText(t.ctx_used, t.ctx_window);
-    const ctxLine = (t.state === "done" || t.state === "err") ? finalCtx
-      : t.state === "run" ? (finalCtx || contextText(lastCtxUsed, lastCtxWindow))
+    // A running turn learns its window only when it completes, so it measures its own tokens
+    // against the last window a turn actually ran with.
+    const ctxLine = (t.state === "done" || t.state === "err") ? contextText(t.ctx_used, t.ctx_window)
+      : t.state === "run" ? contextText(t.ctx_used || lastCtxUsed, t.ctx_window || lastCtxWindow || ctxWindowHint)
       : "";
     const note = t.state === "enq" ? "в очереди · " + queuePos
       : t.state === "unknown" ? "статус неизвестен" : undefined;
-    items.push({ kind: "turn", seq: t.seq, text: t.text || "", time: t.time, groups, state: t.state, note, ctxLine, ctxTime: lastGroupTime });
-    if(t.ctx_used){ lastCtxUsed = t.ctx_used; lastCtxWindow = t.ctx_window; } // carry the known context forward to a later running turn
+    items.push({ kind: "turn", seq: t.turn_seq, text: t.text || "", time: t.time, userPos, dividerBefore, groups, state: t.state, note, ctxLine, ctxTime: lastGroupTime });
+    if(t.ctx_used) lastCtxUsed = t.ctx_used; // carry the known context forward to a later running turn
+    if(t.ctx_window) lastCtxWindow = t.ctx_window;
   }
   return items;
 }
@@ -158,19 +176,26 @@ function updateBubble(d, cls, html, time, dataPos, raw){
   return d;
 }
 // indicator is the per-turn tail dots: null for a settled turn (done/err — err shows its
-// error block); animated + ✕ for run; dim note for enq/unknown.
-function indicator(state, note, onAbort){
+// error block); animated + ✕ for run (aborts the whole session); dim note + ✕ for enq (drops
+// only this message); dim note for unknown. onStop(state, seq) resolves false when it failed,
+// re-enabling the button.
+function indicator(state, seq, note, onStop){
   if(state === "done" || state === "err" || state === undefined) return null;
   const animated = state === "run";
-  const abortable = state === "run" || state === "enq";
+  const stoppable = state === "run" || state === "enq";
   const d = document.createElement("div");
   d.className = "msg assistant typing" + (animated ? "" : " queued");
-  // The only note left is the enq queue position ('в очереди · N'). The context line is a
-  // separate tool bubble rendered below the dots (see buildItem), so the running indicator
-  // is just the animated dots + the ✕ abort button.
   const queueNote = note ? '<span class="qnote">'+esc(note)+'</span>' : "";
-  d.innerHTML = DOTS + queueNote + (abortable ? '<button class="stop" title="Прервать">✕</button>' : "");
-  if(abortable){ const b = d.querySelector(".stop"); if(b){ b.disabled = !onAbort; if(onAbort) b.addEventListener("click", onAbort); } }
+  const title = animated ? "Прервать" : "Убрать из очереди";
+  d.innerHTML = DOTS + queueNote + (stoppable ? '<button class="stop" title="'+title+'">✕</button>' : "");
+  const b = stoppable && d.querySelector(".stop");
+  if(b){
+    b.disabled = !onStop;
+    if(onStop) b.addEventListener("click", () => {
+      b.disabled = true;
+      Promise.resolve(onStop(state, seq)).then(ok => { if(ok === false) b.disabled = false; });
+    });
+  }
   return d;
 }
 
@@ -185,27 +210,25 @@ function reuseImages(root, bySrc){
   });
 }
 
-function renderKey(it, index){
+function renderKey(it){
   if(it.kind === "turn") return "turn:" + it.seq;
-  // Prefer the event seq over the list index: it keeps the key stable when items above
-  // (the unread divider) come and go, which node reuse and FLIP shifts both rely on.
-  if(it.kind === "bubble") return "bubble:" + (it.key !== undefined ? "e" + it.key : index) + ":" + it.cls;
+  if(it.kind === "bubble") return "bubble:" + it.key;
   return "";
 }
 
 function renderSig(it){
   if(it.kind === "turn"){
     return JSON.stringify({
-      text: it.text, time: it.time, state: it.state, note: it.note, ctxLine: it.ctxLine,
+      text: it.text, time: it.time, userPos: it.userPos, dividerBefore: !!it.dividerBefore, state: it.state, note: it.note, ctxLine: it.ctxLine,
       groups: it.groups.map(g => ({
         divider: g.divider,
         cls: g.cls, tool: g.tool, time: g.time, startPos: g.startPos, maxPos: g.maxPos,
         joinPrev: !!g.joinPrev, joinNext: !!g.joinNext,
-        blocks: (g.blocks || []).map(b => ({ id: b.id, role: b.role, text: b.text, kind: b.kind, time: b.time })),
+        blocks: (g.blocks || []).map(b => ({ role: b.role, text: b.text, kind: b.kind, time: b.time })),
       })),
     });
   }
-  if(it.kind === "bubble") return JSON.stringify({ cls: it.cls, text: it.text, md: it.md, time: it.time, key: it.key });
+  if(it.kind === "bubble") return JSON.stringify({ cls: it.cls, text: it.text, md: it.md, time: it.time });
   return "";
 }
 
@@ -225,8 +248,8 @@ function stamp(node, key, sig){
 
 // Each turn child carries a FLIP key (data-flip) AND a content signature (data-csig). The key is an
 // independently animatable unit — answer groups are keyed by the durable position of their first
-// block, not by content-derived block IDs, so tool-label/text changes patch the same DOM node instead
-// of creating an entering replacement. When reading merges bubbles a divider used to split, the
+// block, so tool-label/text changes patch the same DOM node instead of creating an entering
+// replacement. When reading merges bubbles a divider used to split, the
 // merged bubble inherits the leading part's position key and stays put. The content signature gates
 // formatting and DOM replacement; join classes update separately without rebuilding bubble contents.
 function childSig(kind, extra){ return JSON.stringify([kind, extra]); }
@@ -251,7 +274,7 @@ function reconcileChildren(parent, desired){
 // delta or a run→done flip only touches the block that changed — the finished blocks above never
 // re-parse or flicker. `old` is the previous turn node, REUSED AS THE CONTAINER and reconciled in
 // place (children are never re-parented into a fresh div), or null for a fresh build.
-function buildTurn(it, onAbort, old){
+function buildTurn(it, onStop, old){
   const turn = old || document.createElement("div");
   turn.className = "turn"; turn.dataset.seq = it.seq;
   const reuse = new Map();
@@ -276,24 +299,25 @@ function buildTurn(it, onAbort, old){
       ? updateBubble(old, cls, html, time, dataPos, raw)
       : bubble(cls, html, time, dataPos, raw);
   });
-  putBubble("u", childSig("u", [it.text, it.time]), "user", it.time, undefined,
+  const putDivider = () => {
+    // A fresh in-flow node every render (never reused via put() — it carries
+    // no content that could change) — dismissal fades it via fadeOutDivider,
+    // then the next render drops it. It still needs data-flip: beginShift/
+    // playShift only track children that have one, and without it the line
+    // snapped straight to its final layout position on every shift while
+    // everything else around it slid smoothly — the "out of sync" look.
+    const dv = divider();
+    dv.dataset.flip = "divider";
+    desired.push(dv);
+  };
+  if(it.dividerBefore) putDivider();
+  putBubble("u", childSig("u", [it.text, it.time, it.userPos]), "user", it.time, it.userPos,
     () => ({ html: mdSafe(it.text), raw: it.text }));
   for(const g of it.groups){
-    if(g.divider){
-      // A fresh in-flow node every render (never reused via put() — it carries
-      // no content that could change) — dismissal fades it via fadeOutDivider,
-      // then the next render drops it. It still needs data-flip: beginShift/
-      // playShift only track children that have one, and without it the line
-      // snapped straight to its final layout position on every shift while
-      // everything else around it slid smoothly — the "out of sync" look.
-      const dv = divider();
-      dv.dataset.flip = "divider";
-      desired.push(dv);
-      continue;
-    }
+    if(g.divider){ putDivider(); continue; }
     const fk = "g:" + g.startPos;
     const sig = childSig("g", { cls: g.cls, tool: g.tool, time: g.time, maxPos: g.maxPos,
-      blocks: (g.blocks || []).map(b => ({ id: b.id, role: b.role, text: b.text, kind: b.kind, time: b.time })) });
+      blocks: (g.blocks || []).map(b => ({ role: b.role, text: b.text, kind: b.kind, time: b.time })) });
     const node = putBubble(fk, sig, g.cls, g.time, g.maxPos, () => ({
       html: g.blocks.map(b => g.tool ? esc(b.text || "") : mdSafe(b.text || "")).join(g.tool ? "<br>" : ""),
       raw: g.blocks.map(b => b.text || "").join(g.tool ? "\n" : "\n\n"),
@@ -301,12 +325,8 @@ function buildTurn(it, onAbort, old){
     node.classList.toggle("join-prev", !!g.joinPrev);
     node.classList.toggle("join-next", !!g.joinNext);
   }
-  // The working/queued dots — the turn's in-progress indicator. INVARIANT: a turn in progress ALWAYS
-  // shows this block, the WHOLE time it runs; it disappears only when the turn settles (done/err).
-  // Kept a reuse unit so a stream that adds a block above doesn't re-create the animated dots (which
-  // would restart the blink) or flicker them.
-  if(it.state === "run" || it.state === "enq"){
-    put("dots", childSig("dots", [it.state, it.note]), () => indicator(it.state, it.note, onAbort));
+  if(it.state === "run" || it.state === "enq" || it.state === "unknown"){
+    put("dots", childSig("dots", [it.state, it.note]), () => indicator(it.state, it.seq, it.note, onStop));
   }
   // The context "cut line" is the turn's final element — below the dots while running, and the last
   // line once the dots are gone (it slides up to close the gap).
@@ -318,18 +338,18 @@ function buildTurn(it, onAbort, old){
   return turn;
 }
 
-function buildItem(it, onAbort){
+function buildItem(it, onStop){
   if(it.kind === "divider") return divider();
   if(it.kind === "bubble") return bubble(it.cls, it.md ? mdSafe(it.text) : esc(it.text), it.time, undefined, it.text);
-  return buildTurn(it, onAbort, null);
+  return buildTurn(it, onStop, null);
 }
 
-export function paint(col, items, onAbort){
+export function paint(col, items, onStop){
   const nodes = reusableNodes(col);
   const desired = []; // ordered final nodes, reconciled into `col` in place (no fragment detach)
   const fresh = [];   // freshly-built nodes that may hold NEW <img> elements to reconnect
-  items.forEach((it, index) => {
-    const key = renderKey(it, index);
+  items.forEach(it => {
+    const key = renderKey(it);
     const sig = renderSig(it);
     const old = key && nodes.get(key);
     if(old && old.dataset.renderSig === sig){
@@ -342,10 +362,10 @@ export function paint(col, items, onAbort){
     let built, reusedContainer = false;
     if(it.kind === "turn"){
       const oc = old && old.classList && old.classList.contains("turn") ? old : null;
-      built = buildTurn(it, onAbort, oc);
+      built = buildTurn(it, onStop, oc);
       reusedContainer = !!oc; // its children (incl. images) were reused in place — no new imgs to swap
     } else {
-      built = buildItem(it, onAbort);
+      built = buildItem(it, onStop);
     }
     if(old) nodes.delete(key);
     const stamped = stamp(built, key, sig);
@@ -371,8 +391,8 @@ export function paint(col, items, onAbort){
   reconcileChildren(col, desired);
 }
 
-export function renderSession(col, turns, unreadAfter, onAbort, holdSplits, joinHeldSplits){
-  paint(col, renderModel(turns, unreadAfter, holdSplits, joinHeldSplits), onAbort);
+export function renderSession(col, turns, unreadAfter, onStop, holdSplits, joinHeldSplits, ctxWindowHint, readOnly){
+  paint(col, renderModel(turns, unreadAfter, holdSplits, joinHeldSplits, ctxWindowHint, readOnly), onStop);
 }
 
 // --- smooth live updates (FLIP) ---
@@ -381,18 +401,13 @@ export function renderSession(col, turns, unreadAfter, onAbort, holdSplits, join
 // animation. A FLIP *unit* is what actually moves: a standalone keyed bubble, or a CHILD of a .turn
 // (user bubble / answer group / indicator, keyed turnKey|data-flip) — the .turn container itself is
 // never transformed, so parent and child shifts cannot compound, and an in-turn divider collapse
-// animates block-level. Transforms only — layout and all scroll maths stay exact. Reduced motion
-// disables it. Dismissing the unread line is a SEPARATE first phase (fadeOutDivider): the line fades
+// animates block-level. Transforms only — layout and all scroll maths stay exact.
+// Dismissing the unread line is a SEPARATE first phase (fadeOutDivider): the line fades
 // in place, THEN a follow-up render removes it and this FLIP collapses the gap.
 export const DIVIDER_FADE_MS = 300; // .readline.leaving lineout duration in app.css
 const SHIFT_MS = 180, SHIFT_CAP = 800;
 
-function reducedMotion(){
-  return typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
-}
-
 export function beginShift(col){
-  if(reducedMotion()) return null;
   const units = new Map(), keys = new Set(), holdSplits = new Map();
   Array.from(col.children).forEach(node => {
     const key = node.dataset && node.dataset.renderKey;
@@ -480,9 +495,9 @@ export function playShift(col, snap){
 // fadeOutDivider dismisses the unread line as its FIRST phase: the real in-flow .readline node fades
 // in place (opacity → 0) exactly where it sits, so it scrolls with the messages and needs no ghost or
 // coordinates. commitLive waits DIVIDER_FADE_MS, then a normal render removes it and playShift
-// collapses the gap. Returns false (no node / reduced motion) so the caller collapses immediately.
+// collapses the gap. Returns false when there is no divider to fade.
 export function fadeOutDivider(col){
-  if(!col || reducedMotion()) return false;
+  if(!col) return false;
   const dv = col.querySelector(".readline");
   if(!dv) return false;
   dv.classList.add("leaving");

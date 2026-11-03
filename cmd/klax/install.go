@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -32,13 +33,38 @@ func installBinary() string {
 }
 
 func copyFile(src, dst string, mode os.FileMode) error {
-	data, err := os.ReadFile(src)
+	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
-	// Remove old file first to avoid "text file busy" when overwriting a running binary.
-	os.Remove(dst)
-	return os.WriteFile(dst, data, mode)
+	defer in.Close()
+	out, err := os.CreateTemp(filepath.Dir(dst), ".klax-install-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(out.Name())
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	if err := out.Chmod(mode); err != nil {
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(dst))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	if err := os.Rename(out.Name(), dst); err != nil {
+		return err
+	}
+	return dir.Sync()
 }
 
 // unitDrifted reports whether the file at path differs from the expected

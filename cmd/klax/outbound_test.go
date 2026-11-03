@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,10 +35,16 @@ func TestRewriteOutboundForUI(t *testing.T) {
 	d.store.New("tg:1", "one", cwd, session.ScopeDefaults{})
 	d.runners = make(map[runnerKey]*sessionRunner)
 	d.uiHub = newUIHub() // UI on: the file-link rewrite is enabled
-	created := d.store.SessionsFor("tg:1")[0].Created
+	klaxID := d.store.SessionsFor("tg:1")[0].KlaxID
 
 	md := "img ![c](chart.png) esc [r](../../../etc/passwd) web [w](https://x.com/a)"
-	out := d.rewriteOutboundForUI("tg:1", created, 1, md)
+	out, published := d.rewriteOutboundForUI("tg:1", klaxID, 1, md)
+	if published {
+		t.Fatal("a degraded link was reported as published")
+	}
+	if _, published := d.rewriteOutboundForUI("tg:1", klaxID, 1, "img ![c](chart.png) web [w](https://x.com/a)"); !published {
+		t.Fatal("published links reported as degraded")
+	}
 
 	if !strings.Contains(out, "![c](/api/file?ref=") {
 		t.Fatalf("in-root image must be rewritten to a capability URL: %q", out)
@@ -52,7 +59,7 @@ func TestRewriteOutboundForUI(t *testing.T) {
 		t.Fatalf("remote link must be untouched: %q", out)
 	}
 	// The snapshot landed in the durable store as an out-* entry.
-	filesDir := filepath.Dir(sessfiles.Open("tg:1", created).Path("x"))
+	filesDir := filepath.Dir(sessfiles.Open("tg:1", klaxID).Path("x"))
 	ents, _ := os.ReadDir(filesDir)
 	found := false
 	for _, e := range ents {
@@ -66,7 +73,7 @@ func TestRewriteOutboundForUI(t *testing.T) {
 
 	// With the UI off the markdown is returned unchanged.
 	d.uiHub = nil
-	if got := d.rewriteOutboundForUI("tg:1", created, 1, md); got != md {
+	if got, _ := d.rewriteOutboundForUI("tg:1", klaxID, 1, md); got != md {
 		t.Fatalf("UI-off must pass through unchanged: %q", got)
 	}
 }
@@ -85,10 +92,10 @@ func TestRewriteOutboundSurvivesADeletedOriginal(t *testing.T) {
 	d.store.New("tg:1", "one", cwd, session.ScopeDefaults{})
 	d.runners = make(map[runnerKey]*sessionRunner)
 	d.uiHub = newUIHub()
-	created := d.store.SessionsFor("tg:1")[0].Created
+	klaxID := d.store.SessionsFor("tg:1")[0].KlaxID
 
 	md := "see [report](report.csv)"
-	first := d.rewriteOutboundForUI("tg:1", created, 1, md)
+	first, _ := d.rewriteOutboundForUI("tg:1", klaxID, 1, md)
 	if !strings.Contains(first, "[report](/api/file?ref=") {
 		t.Fatalf("first render must publish the file: %q", first)
 	}
@@ -97,7 +104,7 @@ func TestRewriteOutboundSurvivesADeletedOriginal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	second := d.rewriteOutboundForUI("tg:1", created, 1, md)
+	second, _ := d.rewriteOutboundForUI("tg:1", klaxID, 1, md)
 	if second != first {
 		t.Fatalf("a rebuild after the original vanished changed the link:\n first=%q\nsecond=%q", first, second)
 	}
@@ -120,20 +127,20 @@ func TestRewriteOutboundCapturesEachTurnsVersion(t *testing.T) {
 	d.store.New("tg:1", "one", cwd, session.ScopeDefaults{})
 	d.runners = make(map[runnerKey]*sessionRunner)
 	d.uiHub = newUIHub()
-	created := d.store.SessionsFor("tg:1")[0].Created
+	klaxID := d.store.SessionsFor("tg:1")[0].KlaxID
 
 	md := "готово [summary](summary.md)"
-	turn1 := d.rewriteOutboundForUI("tg:1", created, 1, md)
+	turn1, _ := d.rewriteOutboundForUI("tg:1", klaxID, 1, md)
 
 	if err := os.WriteFile(src, []byte("# v2 corrected\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	turn2 := d.rewriteOutboundForUI("tg:1", created, 2, md)
+	turn2, _ := d.rewriteOutboundForUI("tg:1", klaxID, 2, md)
 
 	if turn2 == turn1 {
 		t.Fatalf("the corrected file was served as the old snapshot — the fix is invisible: %q", turn2)
 	}
-	if again := d.rewriteOutboundForUI("tg:1", created, 1, md); again != turn1 {
+	if again, _ := d.rewriteOutboundForUI("tg:1", klaxID, 1, md); again != turn1 {
 		t.Fatalf("re-rendering turn 1 changed its link:\n was=%q\nnow=%q", turn1, again)
 	}
 	body1, body2 := servedBody(t, d, turn1), servedBody(t, d, turn2)
@@ -162,7 +169,7 @@ func servedBody(t *testing.T, d *daemon, rewritten string) string {
 	if !ok {
 		t.Fatalf("token %q not in the index", tok)
 	}
-	data, err := os.ReadFile(sessfiles.Open(ref.sk, ref.created).Path(ref.stored))
+	data, err := os.ReadFile(sessfiles.Open(ref.sk, ref.klaxID).Path(ref.stored))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,18 +185,18 @@ func TestRewriteOutboundResolvesAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newDaemon := func() (*daemon, int64) {
+	newDaemon := func(klaxID string) *daemon {
 		d := newTestDeliveryDaemon(&fakeTransport{})
 		d.store = &session.Store{Chats: map[string]*session.ChatSessions{}, Scope: map[string]*session.ScopeDefaults{}}
-		d.store.New("tg:1", "one", cwd, session.ScopeDefaults{})
+		d.store.Add("tg:1", &session.Session{Name: "one", CWD: cwd})
+		d.store.UpdateActive("tg:1", func(s *session.Session) { s.KlaxID = klaxID })
 		d.runners = make(map[runnerKey]*sessionRunner)
 		d.uiHub = newUIHub()
-		return d, d.store.SessionsFor("tg:1")[0].Created
+		return d
 	}
 
 	md := "see [report](report.csv)"
-	d1, created1 := newDaemon()
-	first := d1.rewriteOutboundForUI("tg:1", created1, 1, md)
+	first, _ := newDaemon("lOGezVsS").rewriteOutboundForUI("tg:1", "lOGezVsS", 1, md)
 	if !strings.Contains(first, "/api/file?ref=") {
 		t.Fatalf("first render must publish the file: %q", first)
 	}
@@ -197,11 +204,7 @@ func TestRewriteOutboundResolvesAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	d2, created2 := newDaemon()
-	if created2 != created1 {
-		t.Fatalf("test setup did not reproduce the same durable store (%d vs %d)", created1, created2)
-	}
-	second := d2.rewriteOutboundForUI("tg:1", created2, 1, md)
+	second, _ := newDaemon("lOGezVsS").rewriteOutboundForUI("tg:1", "lOGezVsS", 1, md)
 	if second != first {
 		t.Fatalf("after restart the link changed:\n first=%q\nsecond=%q", first, second)
 	}
@@ -277,6 +280,53 @@ func TestOutboundFilesRejectsOutsideRootAndRemoteLinks(t *testing.T) {
 	}
 }
 
+// Codex answers link their own output as "sandbox:/abs/path" — a convention,
+// not a real URI scheme. Reproduces the exact link Irina's session emitted:
+// non-ASCII filename, spaces, url-escaped. Claude never uses this prefix, so
+// this path is codex-only.
+func TestOutboundFilesResolvesCodexSandboxLinks(t *testing.T) {
+	cwd := t.TempDir()
+	name := "УМК к лекции 6. Ароматные воды и сиропы.docx"
+	if err := os.WriteFile(filepath.Join(cwd, name), []byte("docx"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// codex escapes only the filename segment, keeping path separators intact.
+	href := "sandbox:" + cwd + "/" + url.PathEscape(name)
+	md := "[Скачать файл Word](" + href + ")"
+
+	got := outboundFileRefs(md, cwd)
+	if len(got) != 1 {
+		t.Fatalf("outboundFileRefs did not resolve the sandbox: link: %#v (href=%q)", got, href)
+	}
+	if got[0].name != name {
+		t.Fatalf("resolved name = %q, want %q", got[0].name, name)
+	}
+}
+
+// Codex emits :codex-file-citation{path="..." purpose="output"} instead of a
+// markdown link. Reproduces Irina's answer: raw non-ASCII path, no escaping.
+func TestOutboundFilesResolvesCodexFileCitation(t *testing.T) {
+	cwd := t.TempDir()
+	name := "УМК_ПМ02 исправленная.docx"
+	if err := os.WriteFile(filepath.Join(cwd, name), []byte("docx"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	md := "Доработанная УМК в формате Word:\n\n:codex-file-citation{path=\"" + filepath.Join(cwd, name) + "\" purpose=\"output\"}"
+
+	got := outboundFileRefs(md, cwd)
+	if len(got) != 1 || got[0].name != name {
+		t.Fatalf("outboundFileRefs did not resolve codex-file-citation: %#v", got)
+	}
+	if s := stripFileCitations(md); s != "Доработанная УМК в формате Word:" {
+		t.Fatalf("stripFileCitations = %q", s)
+	}
+	outside := t.TempDir()
+	os.WriteFile(filepath.Join(outside, "x.txt"), []byte("x"), 0600)
+	if got := outboundFileRefs(`:codex-file-citation{path="`+filepath.Join(outside, "x.txt")+`"}`, cwd); len(got) != 0 {
+		t.Fatalf("citation outside cwd must not be delivered: %#v", got)
+	}
+}
+
 // outbound_files=false keeps messenger answers text-only.
 func TestOutboundFilesDisabledByConfig(t *testing.T) {
 	off := false
@@ -321,8 +371,8 @@ func newFileDeliveryFixture(t *testing.T, ctx context.Context, tp *fakeFileTrans
 	d.cfg = &config.Config{}
 	d.store = &session.Store{Chats: map[string]*session.ChatSessions{}, Scope: map[string]*session.ScopeDefaults{}}
 	d.store.New("tg:1", "one", cwd, session.ScopeDefaults{})
-	created := d.store.SessionsFor("tg:1")[0].Created
-	return &messengerDelivery{d: d, ctx: ctx, chatID: "tg:1", sessionKey: "tg:1", sessionCreated: created}
+	klaxID := d.store.SessionsFor("tg:1")[0].KlaxID
+	return &messengerDelivery{d: d, ctx: ctx, chatID: "tg:1", sessionKey: "tg:1", sessionKlaxID: klaxID}
 }
 
 func TestSendOutboundFilesDelivers(t *testing.T) {

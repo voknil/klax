@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
-import { playShift } from "./render.js";
+import { playShift, renderModel, pos, decodePos } from "./render.js";
 
 test("shift animates the visible tail of a tall bubble and skips fully distant bubbles", () => {
   for(const [top, bottom, expected] of [[100, 400, 180], [-3000, 400, 180], [-3000, -2000, 0], [2000, 2300, 0]]){
@@ -43,6 +43,10 @@ class Element {
   }
   removeChild(node) { this.children.splice(this.children.indexOf(node), 1); node.parent = null; }
   querySelectorAll() { return []; }
+  querySelector(sel) {
+    if(sel !== ".stop" || !this.html.includes('class="stop"')) return null;
+    return this.stop ||= { disabled: false, addEventListener(type, fn) { this.click = fn; } };
+  }
 }
 
 function harness(){
@@ -59,10 +63,21 @@ function harness(){
   return { calls, render: context.renderSession, pos: context.pos, col: new Element() };
 }
 
+test("unknown outcome shows its note without a stop button", () => {
+  const h = harness();
+  const turn = { turn_seq: 1, role: "user", text: "request", state: "unknown", blocks: [] };
+  h.render(h.col, [turn]);
+  const tail = h.col.children[0].children.at(-1);
+  assert.ok(tail.html.includes("статус неизвестен"));
+  assert.equal(tail.querySelector(".stop"), null);
+  h.render(h.col, [{ ...turn, state: "done" }]);
+  assert.equal(h.col.children[0].children.length, 1);
+});
+
 test("divider collapse and join preserve unchanged tool contents and skip text formatting", () => {
   const h = harness();
   const blocks = Array.from({ length: 301 }, (_, i) => ({ id: String(i), role: "tool", text: "tool " + i }));
-  const turn = { seq: 1, role: "user", text: "request", state: "done", blocks };
+  const turn = { turn_seq: 1, role: "user", text: "request", state: "done", blocks };
   h.render(h.col, [turn], h.pos(1, 299));
   const container = h.col.children[0];
   const [user, tools, divider, tail] = container.children;
@@ -92,7 +107,7 @@ test("divider collapse and join preserve unchanged tool contents and skip text f
 
 test("content updates patch retained bubbles and join flags clear without rewriting content", () => {
   const h = harness();
-  const turn = { seq: 1, role: "user", text: "request", state: "done", blocks: [
+  const turn = { turn_seq: 1, role: "user", text: "request", state: "done", blocks: [
     { id: "a", role: "assistant", text: "one" },
     { id: "b", role: "assistant", text: "two" },
   ] };
@@ -112,4 +127,77 @@ test("content updates patch retained bubbles and join flags clear without rewrit
   assert.equal(second.classList.contains("join-prev"), false);
   assert.equal(second.writes, 2);
   assert.deepEqual(h.calls, counts);
+});
+
+test("queued ✕ stops only its own turn and re-enables after a failed cancel", async () => {
+  const h = harness();
+  const calls = [];
+  let result = false;
+  const onStop = (state, seq) => { calls.push([state, seq]); return Promise.resolve(result); };
+  h.render(h.col, [
+    { turn_seq: 1, role: "user", text: "running", state: "run", blocks: [] },
+    { turn_seq: 2, role: "user", text: "queued", state: "enq", blocks: [] },
+  ], undefined, onStop);
+  const [runDots, queuedDots] = h.col.children.map(turn => turn.children.find(c => c.dataset.flip === "dots"));
+  assert.match(runDots.html, /title="Прервать"/);
+  assert.match(queuedDots.html, /title="Убрать из очереди"/);
+
+  queuedDots.stop.click();
+  assert.equal(queuedDots.stop.disabled, true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(queuedDots.stop.disabled, false);
+
+  result = true;
+  queuedDots.stop.click();
+  runDots.stop.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls, [["enq", 2], ["enq", 2], ["run", 1]]);
+  assert.equal(queuedDots.stop.disabled, true);
+});
+
+test("a cancelled note neither drives read-advance nor opens the unread divider", () => {
+  const h = harness();
+  h.render(h.col, [
+    { turn_seq: 1, role: "user", text: "running", read: true, state: "run", blocks: [{ id: "a", role: "assistant", text: "one" }] },
+    { turn_seq: 2, role: "user", text: "dropped", read: true, state: "err", blocks: [{ id: "c", role: "system", kind: "cancelled", text: "Отменено" }] },
+  ], h.pos(1, 0));
+  const [, note] = h.col.children[1].children;
+  assert.equal(note.className.split(" ").includes("cancelled"), true);
+  assert.equal(note.dataset.pos, undefined);
+  assert.equal(h.col.children.flatMap(t => t.children).some(c => c.className === "readline"), false);
+});
+
+test("a running turn measures its tokens against the last window a turn ran with", () => {
+  const items = renderModel([
+    { turn_seq: 1, role: "user", state: "done", ctx_used: 100000, ctx_window: 1000000, blocks: [{ id: "a", role: "assistant" }] },
+    { turn_seq: 2, role: "user", state: "done", ctx_used: 150000, blocks: [{ id: "b", role: "assistant" }] },
+    { turn_seq: 3, role: "user", state: "run", ctx_used: 200000, blocks: [{ id: "c", role: "tool" }] },
+  ], undefined);
+  const lines = items.filter(i => i.kind === "turn").map(i => i.ctxLine);
+  assert.deepEqual(lines, ["📊 Контекст: 10% (100k/1000k)", "📊 Контекст: 150k", "📊 Контекст: 20% (200k/1000k)"]);
+});
+
+test("a running turn without a known window uses the tab's window", () => {
+  const items = renderModel([{ turn_seq: 1, role: "user", state: "run", ctx_used: 200000, blocks: [{ id: "c", role: "tool" }] }], undefined, null, false, 1000000);
+  assert.equal(items.find(i => i.kind === "turn").ctxLine, "📊 Контекст: 20% (200k/1000k)");
+});
+
+test("user messages are unread unless the writer typed them in the web UI", () => {
+  const h = harness();
+  const turns = [
+    { turn_seq: 1, role: "user", text: "typed", read: true, state: "done", blocks: [{ id: "a", role: "assistant", text: "a" }] },
+    { turn_seq: 2, role: "user", text: "injected", state: "done", blocks: [{ id: "b", role: "assistant", text: "b" }] },
+  ];
+  const kinds = node => node.children.map(c => c.className.split(" ")[0]);
+  h.render(h.col, turns, h.pos(1, 0), null, null, false, 0, false);
+  assert.equal(h.col.children[0].children[0].dataset.pos, undefined);
+  assert.equal(h.col.children[1].children[1].dataset.pos, String(h.pos(2, -1)));
+  assert.deepEqual(kinds(h.col.children[1]), ["readline", "msg", "msg"]);
+  h.render(h.col, turns, h.pos(0, 0), null, null, false, 0, true);
+  assert.equal(h.col.children[0].children[1].dataset.pos, String(h.pos(1, -1)));
+  assert.deepEqual(kinds(h.col.children[0]), ["readline", "msg", "msg"]);
+});
+
+test("decodePos round-trips a user-message position", () => {
+  for(const [turn, block] of [[0, 0], [5, -1], [5, 0], [5, 7]]) assert.deepEqual(decodePos(pos(turn, block)), { turn, block });
 });

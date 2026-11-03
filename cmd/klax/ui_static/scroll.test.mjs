@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { TurnModel } from "./model.js";
-import { pos } from "./render.js";
+import { pos, decodePos, answerBlock, readPositions } from "./render.js";
+import { apiError, syncInterval } from "./base.js";
+globalThis.document = { getElementById: () => ({ textContent: JSON.stringify({ sync_ms: 250, retry_min_ms: 625, retry_max_ms: 5000 }) }) };
 
 function harness(){
   let now = 0, nextTimer = 0;
@@ -14,8 +16,8 @@ function harness(){
   log.addEventListener = (name, fn) => { logEvents[name] = fn; };
   const arm = (fn, delay) => { const id = ++nextTimer; timers.set(id, { fn, at: now + delay }); return id; };
   const context = vm.createContext({
-    TurnModel, calls, pos, fadeOutDivider: () => false,
-    document: { visibilityState: "visible", getElementById: id => id === "log" ? log : col,
+    TurnModel, calls, pos, decodePos, answerBlock, readPositions, isReadOnly: () => false, apiError, syncInterval, fadeOutDivider: () => false,
+    document: { visibilityState: "visible", getElementById: id => id === "log" ? log : col, querySelector: () => null,
       addEventListener: (name, fn) => { documentEvents[name] = fn; } },
     setTimeout: arm, requestAnimationFrame: fn => arm(fn, 16),
     cancelAnimationFrame(id){ timers.delete(id); },
@@ -26,6 +28,7 @@ function harness(){
   vm.runInContext(source + `
     active = 1; loaded[1] = loaded[2] = true; readThrough[1] = 0;
     globalThis.markReadActual = markRead;
+    globalThis.reportReadActual = reportRead;
     globalThis.commitLiveActual = commitLive;
     globalThis.rerenderStructuralActual = rerenderStructural;
     advanceReadThroughPastViewport = () => { calls.push("advance"); return true; };
@@ -35,7 +38,10 @@ function harness(){
     reportRead = () => {};
     rerenderStructural = () => calls.push("render");
     commitLive = () => calls.push("animate");
+    globalThis.startTurn = () => model.loadWindow(1, { from: "0.-1", groups: [{ key: "t:1:1", ord: "1.0", head: { turn_seq: 1, role: "user", state: "run" } }] });
+    globalThis.addBlock = text => { const n = model.turns(1)[0].blocks.length; model.applyGroup(1, { key: "t:1:1", ord: "1.0", blocks: { start: n, append: [{ text }] } }); };
   `, context);
+  vm.runInContext(source.match(/document.addEventListener\("visibilitychange", \(\) => \{[\s\S]*?\n  \}\);/)[0], context);
   function tick(ms){
     const end = now + ms;
     while(true){
@@ -55,6 +61,187 @@ test("near-bottom reading is not bottom-following; fractional bottom and short l
   assert.equal(h.run("atBottom()"), true);
   h.col.offsetHeight = 400; h.log.scrollTop = 0;
   assert.equal(h.run("atBottom()"), true);
+});
+
+test("a failed read-marker save displays the server error, while success is quiet", async () => {
+  const h = harness();
+  h.run(`
+    readThrough[1] = pos(2, 3);
+    showNotice = text => calls.push(text);
+    api = async () => ({ ok: false, json: async () => ({ error: { code: "read-save-failed", message: "Не удалось сохранить отметку прочитанного" } }) });
+    flushRead(1);
+  `);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(h.calls, ["Не удалось сохранить отметку прочитанного"]);
+  h.calls.length = 0;
+  h.run("api = async () => ({ ok: true }); flushRead(1)");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(h.calls, []);
+});
+
+test("read reports skip positions in flight and confirmed by the server", async () => {
+  const h = harness();
+  h.run(`
+    readThrough[1] = pos(2, 3);
+    globalThis.readResponses = [];
+    api = (url, opts) => { calls.push(opts); return new Promise(resolve => readResponses.push(resolve)); };
+    flushRead(1); flushRead(1);
+  `);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0].keepalive, true);
+  h.run("readResponses[0]({ ok: true })");
+  await new Promise(resolve => setImmediate(resolve));
+  h.run("flushRead(1); flushRead(1)");
+  assert.equal(h.calls.length, 1);
+});
+
+test("new read progress is sent while an older report is in flight", async () => {
+  for(const order of [[0, 1], [1, 0]]){
+    const h = harness();
+    h.run(`
+      globalThis.readResponses = [];
+      api = (url, opts) => { calls.push(JSON.parse(opts.body).read_pos); return new Promise(resolve => readResponses.push(resolve)); };
+      readThrough[1] = pos(2, 3); flushRead(1);
+      readThrough[1] = pos(2, 4); flushRead(1);
+    `);
+    assert.deepEqual(h.calls, ["2.3", "2.4"]);
+    for(const i of order){
+      h.run(`readResponses[${i}]({ ok: true })`);
+      await new Promise(resolve => setImmediate(resolve));
+      h.run("flushRead(1)");
+      assert.equal(h.calls.length, 2);
+    }
+  }
+});
+
+test("read reports wait for the live channel and send the latest position on its recovery", async () => {
+  const h = harness();
+  h.run(`
+    reportRead = reportReadActual;
+    readThrough[1] = pos(2, 3);
+    globalThis.failRead = true;
+    api = (url, opts) => {
+      calls.push(JSON.parse(opts.body).read_pos);
+      return failRead ? Promise.reject(new Error("offline")) : Promise.resolve({ ok: true });
+    };
+    flushRead(1);
+  `);
+  await new Promise(resolve => setImmediate(resolve));
+  h.run("host.onHealth(false, 1); readThrough[1] = pos(2, 4); reportRead(1)");
+  h.tick(60000);
+  assert.deepEqual(h.calls, ["2.3"]);
+  h.run("failRead = false; host.onHealth(true, 0)");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(h.calls, ["2.3", "2.4"]);
+  h.run("host.onHealth(true, 0)");
+  h.tick(60000);
+  assert.equal(h.calls.length, 2);
+});
+
+test("a failed read holds later progress until the next live response", async () => {
+  const h = harness();
+  h.run(`
+    reportRead = reportReadActual;
+    showNotice = () => {};
+    readThrough[1] = pos(2, 3);
+    api = async (url, opts) => { calls.push(JSON.parse(opts.body).read_pos); return { ok: false, status: 503 }; };
+    flushRead(1);
+  `);
+  await new Promise(resolve => setImmediate(resolve));
+  h.run("readThrough[1] = pos(2, 4); reportRead(1)");
+  h.tick(60000);
+  assert.deepEqual(h.calls, ["2.3"]);
+  h.run("host.onHealth(true, 0)");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(h.calls, ["2.3", "2.4"]);
+});
+
+for(const [status, retries] of [[408, true], [429, true], [503, true], [400, false], [401, false], [404, false]]){
+  test(`read reports ${retries ? "retry" : "stop after"} HTTP ${status}`, async () => {
+    const h = harness();
+    h.run(`
+      reportRead = reportReadActual;
+      showNotice = () => {};
+      readThrough[1] = pos(2, 3);
+      api = async () => { calls.push("read"); return { ok: false, status: ${status} }; };
+      flushRead(1);
+    `);
+    await new Promise(resolve => setImmediate(resolve));
+    h.tick(60000);
+    assert.equal(h.calls.length, 1);
+    h.run("host.onHealth(true, 0)");
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.calls.length, retries ? 2 : 1);
+  });
+}
+
+test("forgetting a session stops pending and in-flight read retries", async () => {
+  for(const pending of [true, false]){
+    const h = harness();
+    h.run(`
+      reportRead = reportReadActual;
+      readThrough[1] = pos(2, 3);
+      api = () => { calls.push("read"); return new Promise((_, reject) => { globalThis.rejectRead = reject; }); };
+      flushRead(1);
+    `);
+    if(pending){
+      h.run('rejectRead(new Error("offline"))');
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    h.run("forgetSession(1)");
+    if(!pending){
+      h.run('rejectRead(new Error("offline"))');
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    h.run("host.onHealth(true, 0)");
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(h.calls, ["read"]);
+  }
+});
+
+test("hiding the browser tab flushes every session's pending read progress", async () => {
+  const h = harness();
+  h.run(`
+    reportRead = reportReadActual;
+    readThrough[1] = pos(2, 3); reportRead(1);
+    readThrough[2] = pos(4, 0); reportRead(2);
+    readThrough[3] = readSaved[3] = pos(1, 0);
+    readThrough[4] = readSending[4] = pos(1, 0);
+    active = 2; stick = false;
+    api = async (url, opts) => { calls.push(opts); return { ok: true }; };
+    document.visibilityState = "hidden";
+  `);
+  h.documentEvents.visibilitychange();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(h.calls.map(opts => JSON.parse(opts.body).klax_id), ["1", "2"]);
+  assert.ok(h.calls.every(opts => opts.keepalive));
+  h.tick(60000);
+  h.documentEvents.visibilitychange();
+  assert.equal(h.calls.length, 2);
+});
+
+test("read reports collect the latest position for 250 ms and allow an immediate flush", async () => {
+  const h = harness();
+  h.run(`
+    reportRead = reportReadActual;
+    readThrough[1] = pos(2, 3);
+    api = async (url, opts) => { calls.push(JSON.parse(opts.body).read_pos); return { ok: true }; };
+    reportRead(1);
+  `);
+  h.tick(200);
+  h.run("readThrough[1] = pos(2, 4); reportRead(1)");
+  h.tick(49);
+  assert.deepEqual(h.calls, []);
+  h.tick(1);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(h.calls, ["2.4"]);
+  h.run("readThrough[1] = pos(3, 0); reportRead(1)");
+  h.tick(100);
+  h.run("flushRead(1)");
+  await new Promise(resolve => setImmediate(resolve));
+  h.tick(250);
+  h.run("flushRead(1)");
+  assert.deepEqual(h.calls, ["2.4", "3.0"]);
 });
 
 test("bottom jump animates to settled geometry and has no persistent scroll lock", () => {
@@ -92,10 +279,15 @@ test("live updates wait for the jump and resume when it ends", () => {
   assert.ok(h.calls.includes("animate"));
 });
 
-test("reduced motion jumps on the next frame", () => {
+test("system motion preferences do not disable smooth scrolling", () => {
   const h = harness();
   h.run("matchMedia = () => ({ matches: true }); toggleToBottom = () => {}; jumpToBottom()");
   h.tick(16);
+  assert.equal(h.log.scrollTop, 1350);
+  assert.notEqual(h.run("bottomJumpFrame"), 0);
+  h.tick(112);
+  assert.ok(h.log.scrollTop > 1350 && h.log.scrollTop < 1400);
+  h.tick(128);
   assert.equal(h.log.scrollTop, 1400);
   assert.equal(h.run("bottomJumpFrame"), 0);
 });
@@ -131,10 +323,10 @@ test("held touch and live animations postpone read mutations", () => {
 test("watching the bottom stays read with a resting finger and programmatic scroll timers", () => {
   const h = harness();
   h.log.scrollTop = 1400;
-  h.run('model.upsertUser(1, { seq: 1 }, "run"); model.appendBlock(1, 1, { text: "answer" })');
+  h.run('startTurn(); addBlock("answer")');
   h.run("readTouching = true");
   assert.equal(h.run("markReadActual(1)"), true);
-  h.run('model.appendBlock(1, 1, { text: "next" })');
+  h.run('addBlock("next")');
   h.run("readTouching = false; scheduleReadProgress()");
   assert.equal(h.run("markReadActual(1)"), true);
   assert.equal(h.run("readThrough[1]"), pos(1, 1));
@@ -158,7 +350,7 @@ test("continuous live commits keep watermarks current and allow window maintenan
   h.run(`
     markRead = markReadActual; commitLive = commitLiveActual;
     readThrough[1] = 0; stick = true;
-    model.upsertUser(1, { seq: 1 }, "run");
+    startTurn();
     rerender = () => {
       const sc = document.getElementById("log"), col = document.getElementById("logcol");
       col.offsetHeight += 40;
@@ -170,7 +362,7 @@ test("continuous live commits keep watermarks current and allow window maintenan
     };
   `);
   for(let i = 0; i < 120; i++){
-    h.run('model.appendBlock(1, 1, { text: "next" }); host.onAffected(new Set([1]))');
+    h.run('addBlock("next"); host.onAffected(new Set([1]))');
     h.tick(50);
     assert.equal(h.run("readThrough[1]"), pos(1, i));
   }
@@ -180,7 +372,7 @@ test("continuous live commits keep watermarks current and allow window maintenan
 
 test("explicit lifecycle reads bypass a held touch and leave no deferred work after reset", () => {
   const h = harness();
-  h.run('model.upsertUser(1, { seq: 1 }, "run"); model.appendBlock(1, 1, { text: "answer" })');
+  h.run('startTurn(); addBlock("answer")');
   h.run("readTouching = true; scheduleReadProgress()");
   assert.equal(h.run("markReadActual(1, true)"), true);
   assert.equal(h.run("readThrough[1]"), pos(1, 0));
@@ -220,17 +412,38 @@ test("large histories are capped after reaching bottom, not in the approach zone
   assert.deepEqual(h.calls, ["advance", "render"]);
   h.calls.length = 0; h.log.scrollTop = 1400;
   h.run("scheduleReadProgress()"); h.tick(200);
-  assert.deepEqual(h.calls, ["read", "cap", "render"]);
+  assert.deepEqual(h.calls, ["read", "cap", "animate"]);
+});
+
+test("window trimming at the bottom preserves the divider fade before collapse", () => {
+  const h = harness();
+  h.log.scrollTop = 1400;
+  h.run(`
+    commitLive = commitLiveActual;
+    capWindow = () => { calls.push("cap"); return 10; };
+    fadeOutDivider = () => { calls.push("fade"); return true; };
+    DIVIDER_FADE_MS = 300;
+    rerender = () => { calls.push("collapse"); return noMotion(); };
+    scheduleReadProgress();
+  `);
+  h.tick(160);
+  assert.deepEqual(h.calls, ["read", "cap", "fade"]);
+  h.tick(299);
+  assert.equal(h.calls.includes("collapse"), false);
+  h.tick(1);
+  assert.deepEqual(h.calls, ["read", "cap", "fade", "collapse"]);
+  h.tick(1000);
+  assert.equal(h.run("liveBusy"), false);
 });
 
 
 test("blocks received during the jump are read without starting read grace", () => {
   const h = harness();
   h.run(`toggleToBottom = () => {}; markRead = markReadActual;
-    model.upsertUser(1, { seq: 1 }, "run");
-    model.appendBlock(1, 1, { text: "first" }); jumpToBottom();`);
+    startTurn();
+    addBlock("first"); jumpToBottom();`);
   h.tick(100);
-  h.run('model.appendBlock(1, 1, { text: "next" }); host.onAffected(new Set([1]))');
+  h.run('addBlock("next"); host.onAffected(new Set([1]))');
   assert.equal(h.run("rawUnreadCount(1)"), 0);
   assert.equal(h.run("inReadGrace(1)"), false);
 });
