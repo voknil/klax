@@ -301,6 +301,30 @@ func TestOutboundFilesResolvesCodexSandboxLinks(t *testing.T) {
 	}
 }
 
+// Codex emits :codex-file-citation{path="..." purpose="output"} instead of a
+// markdown link. Reproduces Irina's answer: raw non-ASCII path, no escaping.
+func TestOutboundFilesResolvesCodexFileCitation(t *testing.T) {
+	cwd := t.TempDir()
+	name := "УМК_ПМ02 исправленная.docx"
+	if err := os.WriteFile(filepath.Join(cwd, name), []byte("docx"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	md := "Доработанная УМК в формате Word:\n\n:codex-file-citation{path=\"" + filepath.Join(cwd, name) + "\" purpose=\"output\"}"
+
+	got := outboundFileRefs(md, cwd)
+	if len(got) != 1 || got[0].name != name {
+		t.Fatalf("outboundFileRefs did not resolve codex-file-citation: %#v", got)
+	}
+	if s := stripFileCitations(md); s != "Доработанная УМК в формате Word:" {
+		t.Fatalf("stripFileCitations = %q", s)
+	}
+	outside := t.TempDir()
+	os.WriteFile(filepath.Join(outside, "x.txt"), []byte("x"), 0600)
+	if got := outboundFileRefs(`:codex-file-citation{path="`+filepath.Join(outside, "x.txt")+`"}`, cwd); len(got) != 0 {
+		t.Fatalf("citation outside cwd must not be delivered: %#v", got)
+	}
+}
+
 // outbound_files=false keeps messenger answers text-only.
 func TestOutboundFilesDisabledByConfig(t *testing.T) {
 	off := false

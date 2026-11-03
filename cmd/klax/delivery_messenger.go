@@ -228,6 +228,14 @@ func (m *messengerDelivery) Final(res runner.RunResult) {
 		text = "✅"
 	}
 
+	// Codex file directives become attachments below; keep them out of the chat text.
+	answer := text
+	if m.d.outboundFilesEnabled() {
+		if stripped := stripFileCitations(text); stripped != "" {
+			text = stripped
+		}
+	}
+
 	// Convert Claude's Markdown to the transport format.
 	var formatted string
 	switch m.chatFmt {
@@ -253,7 +261,7 @@ func (m *messengerDelivery) Final(res runner.RunResult) {
 		if _, err := d.syncFinalMessageChainChunks(m.chatID, m.replyTo, m.chain, finalChunks, m.chatFmt); err != nil {
 			log.Printf("final delivery failed: %v", err)
 		}
-		m.sendOutboundFiles(text)
+		m.sendOutboundFiles(answer)
 	}
 }
 

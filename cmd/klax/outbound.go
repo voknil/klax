@@ -19,6 +19,20 @@ import (
 // whitespace-free href.
 var outLinkRe = regexp.MustCompile(`(!?)\[([^\]]*)\]\(([^)\s]+)\)`)
 
+// outCitationRe matches the file directive codex emits instead of a markdown
+// link: :codex-file-citation{path="/abs/path" purpose="output"}. The path is
+// raw (not url-escaped) and may contain spaces or non-ASCII.
+var outCitationRe = regexp.MustCompile(`:codex-file-citation\{[^}]*?path="([^"]+)"[^}]*\}`)
+
+// stripFileCitations removes codex file directives from chat text once the
+// files they name are delivered as attachments.
+func stripFileCitations(md string) string {
+	if !strings.Contains(md, ":codex-file-citation{") {
+		return md
+	}
+	return strings.TrimSpace(outCitationRe.ReplaceAllString(md, ""))
+}
+
 // maxOutboundFiles caps how many local files one answer can publish (a budget, not a
 // security boundary — confinement does that).
 const maxOutboundFiles = 16
@@ -67,16 +81,23 @@ func (d *daemon) outboundFilesEnabled() bool {
 // confinement rule as the web UI is used: only existing files below the
 // session working directory are eligible for upload.
 func outboundFileRefs(md, cwd string) []outboundFileRef {
-	if md == "" || cwd == "" || !strings.Contains(md, "](") {
+	if md == "" || cwd == "" || (!strings.Contains(md, "](") && !strings.Contains(md, ":codex-file-citation{")) {
 		return nil
+	}
+	var hrefs []string
+	for _, m := range outLinkRe.FindAllStringSubmatch(md, -1) {
+		hrefs = append(hrefs, m[3])
+	}
+	for _, m := range outCitationRe.FindAllStringSubmatch(md, -1) {
+		// The directive's path is raw; escape it so outboundPath's unescape is a no-op.
+		hrefs = append(hrefs, (&url.URL{Path: m[1]}).EscapedPath())
 	}
 	seen := make(map[string]bool)
 	var out []outboundFileRef
-	for _, m := range outLinkRe.FindAllStringSubmatch(md, -1) {
+	for _, href := range hrefs {
 		if len(out) >= maxOutboundFiles {
 			break
 		}
-		href := m[3]
 		if isRemoteHref(href) {
 			continue
 		}
