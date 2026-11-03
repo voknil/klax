@@ -29,6 +29,10 @@ jobs:
           GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o release/klax-${{ github.ref_name }}-darwin-amd64 ./cmd/klax
           GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o release/klax-${{ github.ref_name }}-darwin-arm64 ./cmd/klax
 
+      - name: Checksums
+        # `klax update` refuses a binary whose sha256 is not listed here.
+        run: cd release && sha256sum klax-* > checksums.txt && cat checksums.txt
+
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
