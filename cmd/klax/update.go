@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -60,7 +62,27 @@ func bumpPatch(srcDir string) error {
 	return err
 }
 
-const repo = "PiDmitrius/klax"
+// repo is the GitHub repository releases are read from. This fork publishes its
+// own binaries (upstream has no macOS builds); KLAX_UPDATE_REPO overrides it,
+// e.g. to follow upstream on Linux.
+var repo = func() string {
+	if v := strings.TrimSpace(os.Getenv("KLAX_UPDATE_REPO")); v != "" {
+		return v
+	}
+	return "voknil/klax"
+}()
+
+// releaseHost is where release assets are fetched from (a variable for tests).
+var releaseHost = "https://github.com"
+
+const (
+	// maxReleaseBinary bounds a downloaded binary, so a hostile or broken server
+	// cannot fill the disk.
+	maxReleaseBinary = 256 << 20
+	// maxChecksumFile bounds checksums.txt.
+	maxChecksumFile = 1 << 20
+	checksumAsset   = "checksums.txt"
+)
 
 var (
 	apiClient      = &http.Client{Timeout: timing.RequestTimeout}
@@ -75,7 +97,7 @@ func latestTag() (string, error) {
 			return http.ErrUseLastResponse
 		},
 	}
-	resp, err := client.Head("https://github.com/" + repo + "/releases/latest")
+	resp, err := client.Head(releaseHost + "/" + repo + "/releases/latest")
 	if err != nil {
 		return "", err
 	}
@@ -93,12 +115,18 @@ func latestTag() (string, error) {
 }
 
 func downloadReleaseTo(tag string, out io.Writer) (string, error) {
-	arch := runtime.GOARCH
-	name := fmt.Sprintf("klax-%s-%s-%s", tag, runtime.GOOS, arch)
-	url := fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", repo, tag, name)
+	name := fmt.Sprintf("klax-%s-%s-%s", tag, runtime.GOOS, runtime.GOARCH)
+	base := fmt.Sprintf("%s/%s/releases/download/%s/", releaseHost, repo, tag)
+
+	// The checksum list is fetched first and is mandatory: an update that cannot
+	// be verified is refused, so a tampered or substituted binary is never run.
+	want, err := expectedChecksum(base+checksumAsset, name)
+	if err != nil {
+		return "", err
+	}
 
 	fmt.Fprintf(out, "downloading %s...\n", name)
-	resp, err := httpclient.GetDownload(downloadClient, url)
+	resp, err := httpclient.GetDownload(downloadClient, base+name)
 	if err != nil {
 		return "", err
 	}
@@ -111,14 +139,68 @@ func downloadReleaseTo(tag string, out io.Writer) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, err := io.Copy(tmp, resp.Body); err != nil {
+	fail := func(err error) (string, error) {
 		tmp.Close()
 		os.Remove(tmp.Name())
 		return "", err
 	}
-	tmp.Close()
-	os.Chmod(tmp.Name(), 0755)
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(resp.Body, maxReleaseBinary+1))
+	if err != nil {
+		return fail(err)
+	}
+	if n > maxReleaseBinary {
+		return fail(fmt.Errorf("download exceeds %d bytes", int64(maxReleaseBinary)))
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != want {
+		return fail(fmt.Errorf("checksum mismatch for %s: expected %s, got %s", name, want, got))
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return "", err
+	}
+	if err := os.Chmod(tmp.Name(), 0o755); err != nil {
+		os.Remove(tmp.Name())
+		return "", err
+	}
+	fmt.Fprintf(out, "checksum verified (sha256 %s)\n", want[:12])
 	return tmp.Name(), nil
+}
+
+// expectedChecksum reads a release's checksums.txt ("<sha256>  <file>" lines, as
+// written by sha256sum) and returns the digest listed for name.
+func expectedChecksum(url, name string) (string, error) {
+	resp, err := httpclient.GetDownload(downloadClient, url)
+	if err != nil {
+		return "", fmt.Errorf("checksums: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("this release has no %s (%s): refusing to install an unverified binary", checksumAsset, resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxChecksumFile))
+	if err != nil {
+		return "", fmt.Errorf("checksums: %w", err)
+	}
+	return parseChecksum(string(body), name)
+}
+
+func parseChecksum(list, name string) (string, error) {
+	for _, line := range strings.Split(list, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || strings.TrimPrefix(fields[1], "*") != name {
+			continue
+		}
+		sum := strings.ToLower(fields[0])
+		if len(sum) != sha256.Size*2 {
+			return "", fmt.Errorf("malformed checksum for %s", name)
+		}
+		if _, err := hex.DecodeString(sum); err != nil {
+			return "", fmt.Errorf("malformed checksum for %s", name)
+		}
+		return sum, nil
+	}
+	return "", fmt.Errorf("%s lists no checksum for %s", checksumAsset, name)
 }
 
 func runUpdate() {

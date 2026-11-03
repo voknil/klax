@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -455,9 +456,22 @@ type uiServer struct {
 
 func (s *uiServer) Name() string { return uiPrefix }
 
+// newUIHTTPServer builds the web UI's http.Server. There is no ReadTimeout or
+// WriteTimeout: uploads are large and /api/changes is a long poll. The header and
+// idle limits stop slow-connection exhaustion regardless.
+func newUIHTTPServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
+	}
+}
+
 func (s *uiServer) Run(ctx context.Context) {
 	s.sendTest.enabled = os.Getenv("KLAX_UI_SEND_TEST") == "1"
-	srv := &http.Server{Addr: s.addr, Handler: s.routes()}
+	srv := newUIHTTPServer(s.addr, s.routes())
 	go func() {
 		<-ctx.Done()
 		shCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -546,8 +560,22 @@ func (s *uiServer) access(r *http.Request) (uiAccess, bool) {
 	if !strings.HasPrefix(h, "Bearer ") {
 		return uiAccess{}, false
 	}
-	access, ok := s.tokens[strings.TrimPrefix(h, "Bearer ")]
-	return access, ok
+	return s.lookupToken(strings.TrimPrefix(h, "Bearer "))
+}
+
+// lookupToken finds the access record for a presented token. Every configured
+// token is compared in constant time and the scan never exits early, so response
+// timing reveals neither how much of a guess matched nor which entry did.
+func (s *uiServer) lookupToken(presented string) (uiAccess, bool) {
+	var found uiAccess
+	ok := false
+	p := []byte(presented)
+	for token, access := range s.tokens {
+		if subtle.ConstantTimeCompare([]byte(token), p) == 1 {
+			found, ok = access, true
+		}
+	}
+	return found, ok
 }
 
 func (s *uiServer) auth(r *http.Request) (string, bool) {

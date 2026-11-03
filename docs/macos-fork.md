@@ -21,6 +21,14 @@ macOS problems should be reported **here**. Please do not bother upstream with t
 Everything else is upstream code. The platform-specific code lives in `*_darwin.go` / `*_linux.go` files
 so that merges from upstream stay small.
 
+## Updates and releases
+
+`klax update` (and the update button in the web UI) reads releases from **this** repository,
+`voknil/klax`, not from upstream; set `KLAX_UPDATE_REPO=owner/name` to follow another one. Every release
+publishes a `checksums.txt` next to the binaries and `klax update` refuses to install a binary whose
+SHA-256 is not listed there (and any release without that file). Cut a release by pushing a `v*` tag;
+the release workflow builds the Linux and macOS binaries and the checksum list.
+
 ## Branches
 
 - `main` — upstream plus the macOS patches. This is what you install from.
